@@ -4,7 +4,7 @@
 # This script provides a Gradio web interface for real-time Chinese transcription.
 # It uses the Silero VAD model for intelligent segmentation, improving accuracy.
 # All output files are saved in a date-stamped subfolder (e.g., 'output/251008').
-# Three files are created per session:
+# Two primary files are created per session:
 #   1. session_fixed_[...].md: LLM-corrected version of the transcription.
 #   2. session_summary_[...].md: LLM-generated summary of the fixed text.
 #
@@ -113,7 +113,7 @@ def load_config():
 
 def get_new_filename(prefix, extension):
     """Generates a new filename inside the daily output directory."""
-    filename = f"{prefix}_{datetime.datetime.now().strftime('%y%m%d_%H%M%S')}{extension}"
+    filename = f"{prefix}_{datetime.datetime.now().strftime('%H%M%S')}{extension}"
     return os.path.join(daily_output_folder, filename)
 
 def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename, output_queue, analysis_type):
@@ -254,6 +254,13 @@ def start_pause_transcription(current_status):
     global session_fixed_filename, session_summary_filename
     if current_status == "Start":
         if not session_fixed_filename:
+            # Create the daily folder if it doesn't exist for this new session
+            today_str = datetime.datetime.now().strftime("%y%m%d")
+            global daily_output_folder
+            daily_output_folder = os.path.join(OUTPUT_FOLDER, today_str)
+            if not os.path.exists(daily_output_folder):
+                os.makedirs(daily_output_folder)
+            
             session_fixed_filename = get_new_filename("session_fixed", ".md")
             session_summary_filename = get_new_filename("session_summary", ".md")
             debug_queue.put(f"New session. Fixed text: '{session_fixed_filename}'")
@@ -306,7 +313,6 @@ def summarize_session():
                 fixed_text = f.read()
             if fixed_text.strip():
                 debug_queue.put("[UI] Summarize button clicked. Sending full fixed text for summary.")
-                # FIX: Use the "non-thinking" model as requested for all calls.
                 threading.Thread(target=call_gemini_api, args=(
                     fixed_text, 'summarize_prompt.md', 'gemini-flash-latest-non-thinking',
                     session_summary_filename, summary_output_queue, 'Summary'
@@ -318,19 +324,27 @@ def summarize_session():
 
 # --- Gradio UI Output Generators ---
 
-def update_ui_loop(q, is_transcription=False):
-    """A generic generator function to update a Gradio Textbox from a queue."""
-    full_text = ""
-    while not exit_event.is_set():
-        try:
-            message = q.get(timeout=0.1)
-            if is_transcription:
-                full_text += message + " "
-            else:
-                full_text = f"{full_text}\n{message}".strip()
-            yield full_text
-        except queue.Empty:
-            yield full_text
+# FIX: This is the factory function pattern to correctly create generators for Gradio's `load` event.
+def create_ui_updater(q, is_transcription=False):
+    """
+    This is a factory function. It creates and returns a new generator function
+    that is tailored to a specific queue. This is the correct way to handle
+    continuous updates for multiple components in Gradio without code duplication.
+    """
+    def update_loop():
+        """The actual generator function that Gradio will run."""
+        full_text = ""
+        while not exit_event.is_set():
+            try:
+                message = q.get(timeout=0.1)
+                if is_transcription:
+                    full_text += message + " "
+                else:
+                    full_text = f"{full_text}\n{message}".strip()
+                yield full_text
+            except queue.Empty:
+                yield full_text # Continue yielding the current text
+    return update_loop
 
 # --- Main Execution ---
 def initialize_models():
@@ -348,13 +362,8 @@ def initialize_models():
         debug_queue.put(f"[FATAL] Failed to load Silero VAD model: {e}"); exit_event.set()
 
 if __name__ == "__main__":
-    # --- Setup Daily Output Folder ---
-    today_str = datetime.datetime.now().strftime("%y%m%d")
-    daily_output_folder = os.path.join(OUTPUT_FOLDER, today_str)
-    if not os.path.exists(daily_output_folder):
-        os.makedirs(daily_output_folder)
-        print(f"Created daily output directory: {daily_output_folder}")
-
+    if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
+    
     available_devices = find_audio_devices()
     
     with gr.Blocks() as demo:
@@ -367,7 +376,6 @@ if __name__ == "__main__":
             ui_vad_slider = gr.Slider(minimum=0.1, maximum=1.0, value=VAD_THRESHOLD, step=0.05, label="VAD Speech Threshold")
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
         
-        # FIX: Ensure autoscroll is set for the desired text areas.
         debug_area = gr.Textbox(label="Debug Information", lines=5, max_lines=5, interactive=False, autoscroll=True)
         output_area = gr.Textbox(label="Transcription Output", lines=10, interactive=False, autoscroll=True)
         
@@ -384,11 +392,17 @@ if __name__ == "__main__":
         ui_vad_slider.change(change_vad_threshold, inputs=[ui_vad_slider])
         audio_source_radio.change(change_audio_source, inputs=[audio_source_radio], outputs=[start_pause_btn])
 
-        # Register UI update generators
-        demo.load(lambda: update_ui_loop(debug_queue), outputs=debug_area)
-        demo.load(lambda: update_ui_loop(output_queue, is_transcription=True), outputs=output_area)
-        demo.load(lambda: update_ui_loop(fixed_text_output_queue), outputs=fixed_text_area)
-        demo.load(lambda: update_ui_loop(summary_output_queue), outputs=summary_area)
+        # --- IMPORTANT Gradio Coding Instruction ---
+        # To make a component update continuously, you must pass a parameter-less GENERATOR 
+        # FUNCTION to the demo.load() event. Do NOT use a lambda like `lambda: my_generator(arg)`.
+        # This will cause Gradio to display the string representation of the generator object,
+        # like "<generator object ...>", instead of iterating over it for updates.
+        # The correct pattern is to use a factory function (like `create_ui_updater` above)
+        # to create and return a tailored generator function for each component.
+        demo.load(create_ui_updater(debug_queue), outputs=debug_area)
+        demo.load(create_ui_updater(output_queue, is_transcription=True), outputs=output_area)
+        demo.load(create_ui_updater(fixed_text_output_queue), outputs=fixed_text_area)
+        demo.load(create_ui_updater(summary_output_queue), outputs=summary_area)
 
     # Pre-load models before launching threads and UI
     initialize_models()
