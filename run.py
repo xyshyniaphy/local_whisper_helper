@@ -3,13 +3,14 @@
 # Description:
 # This script provides a Gradio web interface for real-time Chinese transcription.
 # It uses the Silero VAD model for intelligent segmentation, improving accuracy.
-# All output files are saved in a date-stamped subfolder (e.g., 'output/251008').
-# Two primary files are created per session:
+# All output files are saved in a date-stamped subfolder (e.g., 'output/251009').
+# Three primary files are created per session:
 #   1. 会议记录_[yymmdd_HH].md: LLM-corrected version of the transcription (appended).
 #   2. 会议总结_[yymmdd_HH].md: LLM-generated summary of the fixed text (overwritten).
+#   3. 会议总结_[yymmdd_HH].docx: A DOCX version of the summary file.
 #
 # Author: Gemini
-# Date: 2025-10-08
+# Date: 2025-10-09
 
 # --- Installation ---
 # Use 'uv' (a fast package installer) in your terminal.
@@ -17,8 +18,16 @@
 # 1. Install PyTorch with the specific CUDA version for your system (cu121 is recommended):
 #    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
-# 2. Then, install the other required libraries, including Gradio:
-#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio
+# 2. Then, install the other required libraries, including Gradio and pypandoc:
+#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio pypandoc
+#
+
+# --- IMPORTANT: Additional Installation for DOCX Export ---
+# This script uses Pandoc to convert markdown summaries to .docx files.
+# You MUST install Pandoc on your system for this feature to work.
+# 1. Go to the Pandoc website: https://pandoc.org/installing.html
+# 2. Download and run the installer for Windows.
+# 3. The installer will usually add Pandoc to your system's PATH automatically.
 #
 
 # --- Imports ---
@@ -35,6 +44,10 @@ from dotenv import load_dotenv
 import torch
 import time
 import gradio as gr
+try:
+    import pypandoc
+except ImportError:
+    pypandoc = None
 
 # --- Global State & Queues ---
 is_running = threading.Event()
@@ -63,7 +76,7 @@ OUTPUT_FOLDER = "output"
 VAD_THRESHOLD = 0.5
 
 # --- File & Session Management ---
-daily_output_folder = "" # Will be set to something like 'output/251008'
+daily_output_folder = "" # Will be set to something like 'output/251009'
 session_fixed_filename = None
 session_summary_filename = None
 
@@ -111,6 +124,30 @@ def load_config():
     load_dotenv()
     return {'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY')}
 
+def convert_md_to_docx(md_filepath):
+    """Converts a markdown file to a DOCX file using pypandoc."""
+    if pypandoc is None:
+        debug_queue.put("[ERROR] `pypandoc` library not installed. Cannot create DOCX file.")
+        return
+        
+    if not os.path.exists(md_filepath):
+        debug_queue.put(f"[ERROR] Cannot convert to DOCX. File not found: {md_filepath}")
+        return
+
+    docx_filepath = os.path.splitext(md_filepath)[0] + ".docx"
+    debug_queue.put(f"[INFO] Converting summary to DOCX: '{os.path.basename(docx_filepath)}'")
+
+    try:
+        pypandoc.convert_file(md_filepath, 'docx', outputfile=docx_filepath)
+        debug_queue.put(f"[SUCCESS] Successfully created DOCX file: '{os.path.basename(docx_filepath)}'")
+    except OSError as e:
+        debug_queue.put("[ERROR] Pandoc conversion failed. Is Pandoc installed and in your system's PATH?")
+        debug_queue.put("        Visit https://pandoc.org/installing.html to install it.")
+        debug_queue.put(f"        Details: {e}")
+    except Exception as e:
+        debug_queue.put(f"[ERROR] An unexpected error occurred during DOCX conversion: {e}")
+
+
 def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename, output_queue, analysis_type, overwrite_file=False):
     """A generalized function to call the Gemini API for different tasks."""
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
@@ -136,7 +173,6 @@ def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename
         result = response.json()
         llm_text = result['candidates'][0]['content']['parts'][0]['text']
         
-        # Determine file mode: 'w' for overwrite, 'a' for append
         file_mode = 'w' if overwrite_file else 'a'
         with open(output_filename, file_mode, encoding='utf-8') as f:
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -144,13 +180,16 @@ def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename
             
             if file_mode == 'a':
                 f.write(f"\n\n---\n\n{content_to_write}")
-            else: # 'w'
+            else:
                 f.write(content_to_write)
         
-        # For the UI, we send a slightly different format depending on append/overwrite
         ui_content = f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}"
         output_queue.put(ui_content)
         debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
+
+        if analysis_type == 'Summary':
+            convert_md_to_docx(output_filename)
+
     except Exception as e:
         debug_queue.put(f"[ERROR] Gemini API call for {analysis_type} failed: {e}")
 
@@ -175,7 +214,6 @@ def send_and_reset_log(on_complete=None):
                     session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
                 )
                 if on_complete:
-                    # Give the OS a moment to flush the file write before the next action
                     time.sleep(2) 
                     on_complete()
 
@@ -296,18 +334,34 @@ def stop_transcription():
     """Handles the Stop button logic, including a final summary."""
     is_running.clear()
     debug_queue.put("[UI] Transcription stopped. Processing final text and generating summary...")
-    
-    # Define the final action for the session
-    def finalize_session():
+
+    def final_sequence():
+        """Runs in a background thread to perform final processing steps."""
+        prompt_to_fix = ""
+        with gemini_api_lock:
+            global text_buffer
+            prompt_to_fix = text_buffer
+            text_buffer = ""
+        
+        if prompt_to_fix.strip():
+            debug_queue.put("[INFO] Processing final text chunk before summarizing...")
+            call_gemini_api(
+                prompt_to_fix, 'system_prompt.md', 'gemini-flash-latest-non-thinking', 
+                session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
+            )
+            time.sleep(2)
+        else:
+            debug_queue.put("[INFO] Text buffer empty, proceeding directly to final summary.")
+
         summarize_session()
-        # After summarizing, the session is truly over. Reset filenames.
+        
         global session_fixed_filename, session_summary_filename
         session_fixed_filename, session_summary_filename = None, None
         debug_queue.put("[UI] Session ended.")
-        
-    # Send the last chunk of text, and once it's done, call the finalizer
-    send_and_reset_log(on_complete=finalize_session)
+    
+    threading.Thread(target=final_sequence).start()
     return "Start"
+
 
 def change_vad_threshold(value):
     """Updates the VAD threshold from the UI slider."""
@@ -328,23 +382,63 @@ def change_audio_source(device_name):
     restart_stream_event.set()
     return "Start"
 
+def find_latest_fixed_text_file():
+    """Finds the most recent '会议记录_*.md' file in the output directories."""
+    try:
+        date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
+        if not date_folders:
+            return None, "No date folders found in 'output'."
+        
+        latest_date_folder = sorted(date_folders, reverse=True)[0]
+        full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
+
+        record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and f.endswith('.md')]
+        if not record_files:
+            return None, f"No '会议记录' files found in '{full_folder_path}'."
+        
+        latest_record_file = sorted(record_files, reverse=True)[0]
+        
+        return os.path.join(full_folder_path, latest_record_file), None
+    except Exception as e:
+        return None, f"Error finding latest file: {e}"
+
 def summarize_session():
-    """Handles the 'Summarize' button click by reading the full fixed-text file."""
+    """Handles the 'Summarize' button. Summarizes active session or latest file."""
     with gemini_api_lock:
-        if not session_fixed_filename or not session_summary_filename:
-            debug_queue.put("[WARN] Cannot summarize. No active session.")
+        
+        fixed_text_filepath = session_fixed_filename
+        summary_output_filepath = session_summary_filename
+
+        # If there is no active session, find the latest file from disk.
+        if not fixed_text_filepath:
+            debug_queue.put("[UI] No active session. Searching for the latest '会议记录' file...")
+            latest_file, error_msg = find_latest_fixed_text_file()
+            if error_msg:
+                debug_queue.put(f"[WARN] {error_msg}")
+                return
+            
+            fixed_text_filepath = latest_file
+            # Create a new summary filename in the same directory.
+            timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+            summary_fn = f"会议总结_{timestamp_str}.md"
+            summary_output_filepath = os.path.join(os.path.dirname(fixed_text_filepath), summary_fn)
+            debug_queue.put(f"[INFO] Found latest record file: '{os.path.basename(fixed_text_filepath)}'")
+            debug_queue.put(f"[INFO] New summary will be saved to: '{os.path.basename(summary_output_filepath)}'")
+
+        if not fixed_text_filepath or not summary_output_filepath:
+            debug_queue.put("[WARN] Cannot summarize. File paths are not set.")
             return
+
         try:
-            with open(session_fixed_filename, 'r', encoding='utf-8') as f:
+            with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
             if fixed_text.strip():
-                debug_queue.put("[UI] Summarize button clicked. Sending full fixed text for summary.")
-                # Call Gemini API for summary and overwrite the file and UI
+                debug_queue.put("[UI] Summarize triggered. Sending full fixed text for summary.")
                 threading.Thread(target=call_gemini_api, kwargs={
                     'prompt_text': fixed_text, 
                     'system_prompt_file': 'summarize_prompt.md', 
                     'model_name': 'gemini-flash-latest-non-thinking',
-                    'output_filename': session_summary_filename, 
+                    'output_filename': summary_output_filepath, 
                     'output_queue': summary_output_queue, 
                     'analysis_type': 'Summary',
                     'overwrite_file': True
@@ -352,7 +446,8 @@ def summarize_session():
             else:
                 debug_queue.put("[WARN] No fixed text available to summarize.")
         except FileNotFoundError:
-            debug_queue.put(f"[ERROR] Fixed text file not found: {session_fixed_filename}")
+            debug_queue.put(f"[ERROR] Fixed text file not found: {fixed_text_filepath}")
+
 
 # --- Gradio UI Output Generators ---
 
@@ -365,7 +460,6 @@ def create_ui_updater(q, is_transcription=False, overwrite_ui=False):
             try:
                 message = q.get(timeout=0.1)
                 if overwrite_ui:
-                    # For summary, we just show the latest one.
                     full_text = message
                 elif is_transcription:
                     full_text += message + " "
@@ -415,7 +509,6 @@ if __name__ == "__main__":
             with gr.TabItem("Summary"):
                 summary_area = gr.Textbox(label=None, lines=10, interactive=False, autoscroll=True)
 
-        # Wire up event listeners
         start_pause_btn.click(start_pause_transcription, inputs=[start_pause_btn], outputs=[start_pause_btn])
         summarize_btn.click(summarize_session, outputs=None)
         stop_btn.click(stop_transcription, outputs=[start_pause_btn])
@@ -427,7 +520,6 @@ if __name__ == "__main__":
         demo.load(create_ui_updater(fixed_text_output_queue), outputs=fixed_text_area)
         demo.load(create_ui_updater(summary_output_queue, overwrite_ui=True), outputs=summary_area)
 
-    # Pre-load models before launching threads and UI
     initialize_models()
 
     if not exit_event.is_set():
@@ -439,7 +531,6 @@ if __name__ == "__main__":
         demo.queue().launch()
         print("Gradio UI closed.")
 
-    # Clean shutdown
     exit_event.set()
     restart_stream_event.set()
 
