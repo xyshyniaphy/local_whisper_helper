@@ -5,8 +5,8 @@
 # It uses the Silero VAD model for intelligent segmentation, improving accuracy.
 # All output files are saved in a date-stamped subfolder (e.g., 'output/251008').
 # Two primary files are created per session:
-#   1. 会议记录_[yymmdd_HH].md: LLM-corrected version of the transcription.
-#   2. 会议总结_[yymmdd_HH].md: LLM-generated summary of the fixed text.
+#   1. 会议记录_[yymmdd_HH].md: LLM-corrected version of the transcription (appended).
+#   2. 会议总结_[yymmdd_HH].md: LLM-generated summary of the fixed text (overwritten).
 #
 # Author: Gemini
 # Date: 2025-10-08
@@ -111,7 +111,7 @@ def load_config():
     load_dotenv()
     return {'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY')}
 
-def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename, output_queue, analysis_type):
+def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename, output_queue, analysis_type, overwrite_file=False):
     """A generalized function to call the Gemini API for different tasks."""
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
     config = load_config()
@@ -136,33 +136,53 @@ def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename
         result = response.json()
         llm_text = result['candidates'][0]['content']['parts'][0]['text']
         
-        with open(output_filename, 'a', encoding='utf-8') as f:
+        # Determine file mode: 'w' for overwrite, 'a' for append
+        file_mode = 'w' if overwrite_file else 'a'
+        with open(output_filename, file_mode, encoding='utf-8') as f:
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            f.write(f"\n\n---\n\n### {analysis_type} at {timestamp}\n\n{llm_text}")
+            content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}"
+            
+            if file_mode == 'a':
+                f.write(f"\n\n---\n\n{content_to_write}")
+            else: # 'w'
+                f.write(content_to_write)
         
-        output_queue.put(f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}")
-        debug_queue.put(f"[SUCCESS] {analysis_type} response appended to '{output_filename}'")
+        # For the UI, we send a slightly different format depending on append/overwrite
+        ui_content = f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}"
+        output_queue.put(ui_content)
+        debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
     except Exception as e:
         debug_queue.put(f"[ERROR] Gemini API call for {analysis_type} failed: {e}")
 
-def send_and_reset_log():
+def send_and_reset_log(on_complete=None):
     """Sends the transcribed text to be fixed by Gemini and resets the buffer."""
     global text_buffer
     with gemini_api_lock:
         if not session_fixed_filename:
             debug_queue.put("[WARN] No active session to send.")
+            if on_complete: on_complete()
             return
         
         prompt = text_buffer
         if prompt.strip():
             debug_queue.put("[INFO] Sending content for fixing and resetting buffer...")
             text_buffer = ""
-            threading.Thread(target=call_gemini_api, args=(
-                prompt, 'system_prompt.md', 'gemini-flash-latest-non-thinking', 
-                session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
-            )).start()
+            
+            def api_call_with_callback():
+                """Wrapper to run the API call and an optional callback upon completion."""
+                call_gemini_api(
+                    prompt, 'system_prompt.md', 'gemini-flash-latest-non-thinking', 
+                    session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
+                )
+                if on_complete:
+                    # Give the OS a moment to flush the file write before the next action
+                    time.sleep(2) 
+                    on_complete()
+
+            threading.Thread(target=api_call_with_callback).start()
         else:
             debug_queue.put("[WARN] No new text to send for fixing.")
+            if on_complete: on_complete()
 
 def audio_callback(indata, frames, time, status):
     """Callback for the audio stream, placing data in the queue."""
@@ -249,14 +269,12 @@ def start_pause_transcription(current_status):
     global session_fixed_filename, session_summary_filename
     if current_status == "Start":
         if not session_fixed_filename:
-            # Create the daily folder if it doesn't exist for this new session
             today_str = datetime.datetime.now().strftime("%y%m%d")
             global daily_output_folder
             daily_output_folder = os.path.join(OUTPUT_FOLDER, today_str)
             if not os.path.exists(daily_output_folder):
                 os.makedirs(daily_output_folder)
             
-            # FIX: Generate filenames with new format '会议记录_yymmdd_HH.md'
             timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H")
             fixed_fn = f"会议记录_{timestamp_str}.md"
             summary_fn = f"会议总结_{timestamp_str}.md"
@@ -275,12 +293,20 @@ def start_pause_transcription(current_status):
         return "Start"
 
 def stop_transcription():
-    """Handles the Stop button logic."""
-    global session_fixed_filename, session_summary_filename
+    """Handles the Stop button logic, including a final summary."""
     is_running.clear()
-    send_and_reset_log()
-    debug_queue.put("[UI] Transcription stopped. Press Start for a new session.")
-    session_fixed_filename, session_summary_filename = None, None
+    debug_queue.put("[UI] Transcription stopped. Processing final text and generating summary...")
+    
+    # Define the final action for the session
+    def finalize_session():
+        summarize_session()
+        # After summarizing, the session is truly over. Reset filenames.
+        global session_fixed_filename, session_summary_filename
+        session_fixed_filename, session_summary_filename = None, None
+        debug_queue.put("[UI] Session ended.")
+        
+    # Send the last chunk of text, and once it's done, call the finalizer
+    send_and_reset_log(on_complete=finalize_session)
     return "Start"
 
 def change_vad_threshold(value):
@@ -303,7 +329,7 @@ def change_audio_source(device_name):
     return "Start"
 
 def summarize_session():
-    """Handles the 'Summarize' button click."""
+    """Handles the 'Summarize' button click by reading the full fixed-text file."""
     with gemini_api_lock:
         if not session_fixed_filename or not session_summary_filename:
             debug_queue.put("[WARN] Cannot summarize. No active session.")
@@ -313,10 +339,16 @@ def summarize_session():
                 fixed_text = f.read()
             if fixed_text.strip():
                 debug_queue.put("[UI] Summarize button clicked. Sending full fixed text for summary.")
-                threading.Thread(target=call_gemini_api, args=(
-                    fixed_text, 'summarize_prompt.md', 'gemini-flash-latest-non-thinking',
-                    session_summary_filename, summary_output_queue, 'Summary'
-                )).start()
+                # Call Gemini API for summary and overwrite the file and UI
+                threading.Thread(target=call_gemini_api, kwargs={
+                    'prompt_text': fixed_text, 
+                    'system_prompt_file': 'summarize_prompt.md', 
+                    'model_name': 'gemini-flash-latest-non-thinking',
+                    'output_filename': session_summary_filename, 
+                    'output_queue': summary_output_queue, 
+                    'analysis_type': 'Summary',
+                    'overwrite_file': True
+                }).start()
             else:
                 debug_queue.put("[WARN] No fixed text available to summarize.")
         except FileNotFoundError:
@@ -324,18 +356,18 @@ def summarize_session():
 
 # --- Gradio UI Output Generators ---
 
-def create_ui_updater(q, is_transcription=False):
-    """
-    A factory function to create a unique generator for each Gradio Textbox
-    to prevent UI update bugs.
-    """
+def create_ui_updater(q, is_transcription=False, overwrite_ui=False):
+    """Factory to create a unique generator for each Gradio Textbox."""
     def update_loop():
         """The actual generator function that Gradio will run."""
         full_text = ""
         while not exit_event.is_set():
             try:
                 message = q.get(timeout=0.1)
-                if is_transcription:
+                if overwrite_ui:
+                    # For summary, we just show the latest one.
+                    full_text = message
+                elif is_transcription:
                     full_text += message + " "
                 else:
                     full_text = f"{full_text}\n{message}".strip()
@@ -374,7 +406,6 @@ if __name__ == "__main__":
             ui_vad_slider = gr.Slider(minimum=0.1, maximum=1.0, value=VAD_THRESHOLD, step=0.05, label="VAD Speech Threshold")
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
         
-        # NOTE: `autoscroll=True` ensures these text areas scroll to the bottom when new content is added.
         debug_area = gr.Textbox(label="Debug Information", lines=5, max_lines=5, interactive=False, autoscroll=True)
         output_area = gr.Textbox(label="Transcription Output", lines=10, interactive=False, autoscroll=True)
         
@@ -391,17 +422,15 @@ if __name__ == "__main__":
         ui_vad_slider.change(change_vad_threshold, inputs=[ui_vad_slider])
         audio_source_radio.change(change_audio_source, inputs=[audio_source_radio], outputs=[start_pause_btn])
         
-        # Register UI update generators using the factory function pattern
         demo.load(create_ui_updater(debug_queue), outputs=debug_area)
         demo.load(create_ui_updater(output_queue, is_transcription=True), outputs=output_area)
         demo.load(create_ui_updater(fixed_text_output_queue), outputs=fixed_text_area)
-        demo.load(create_ui_updater(summary_output_queue), outputs=summary_area)
+        demo.load(create_ui_updater(summary_output_queue, overwrite_ui=True), outputs=summary_area)
 
     # Pre-load models before launching threads and UI
     initialize_models()
 
     if not exit_event.is_set():
-        # Start all background worker threads
         threading.Thread(target=vad_and_segmentation_loop, daemon=True).start()
         threading.Thread(target=periodic_gemini_call, daemon=True).start()
         threading.Thread(target=main_audio_loop, daemon=True).start()
