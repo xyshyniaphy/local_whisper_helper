@@ -18,17 +18,11 @@
 # 1. Install PyTorch with the specific CUDA version for your system (cu121 is recommended):
 #    uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
-# 2. Then, install the other required libraries, including Gradio and pypandoc:
-#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio pypandoc
+# 2. Then, install the other required libraries.
+#    `pypandoc-binary` is used to bundle the pandoc executable for DOCX conversion,
+#    so no separate installation of Pandoc is required.
+#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio pypandoc-binary
 #
-
-# --- IMPORTANT: Additional Installation for DOCX Export ---
-# This script uses Pandoc to convert markdown summaries to .docx files.
-# You MUST install Pandoc on your system for this feature to work.
-# 1. Go to the Pandoc website: https://pandoc.org/installing.html
-# 2. Download and run the installer for Windows.
-# 3. The installer will usually add Pandoc to your system's PATH automatically.
-# 
 
 # --- Imports ---
 import sounddevice as sd
@@ -45,6 +39,7 @@ import torch
 import time
 import gradio as gr
 try:
+    # `pypandoc-binary` makes `pypandoc` importable and finds the bundled executable.
     import pypandoc
 except ImportError:
     pypandoc = None
@@ -127,7 +122,7 @@ def load_config():
 def convert_md_to_docx(md_filepath):
     """Converts a markdown file to a DOCX file using pypandoc."""
     if pypandoc is None:
-        debug_queue.put("[ERROR] `pypandoc` library not installed. Cannot create DOCX file.")
+        debug_queue.put("[ERROR] `pypandoc-binary` library not installed. Cannot create DOCX file.")
         return
         
     if not os.path.exists(md_filepath):
@@ -138,11 +133,12 @@ def convert_md_to_docx(md_filepath):
     debug_queue.put(f"[INFO] Converting summary to DOCX: '{os.path.basename(docx_filepath)}'")
 
     try:
+        # Pypandoc will now find the bundled pandoc executable automatically.
         pypandoc.convert_file(md_filepath, 'docx', outputfile=docx_filepath)
         debug_queue.put(f"[SUCCESS] Successfully created DOCX file: '{os.path.basename(docx_filepath)}'")
     except OSError as e:
-        debug_queue.put("[ERROR] Pandoc conversion failed. Is Pandoc installed and in your system's PATH?")
-        debug_queue.put("        Visit https://pandoc.org/installing.html to install it.")
+        # This error is less likely now but kept for robustness.
+        debug_queue.put("[ERROR] Pandoc conversion failed. This might happen if there's a permission issue.")
         debug_queue.put(f"        Details: {e}")
     except Exception as e:
         debug_queue.put(f"[ERROR] An unexpected error occurred during DOCX conversion: {e}")
@@ -393,10 +389,8 @@ def find_latest_fixed_text_file():
         latest_date_folder = sorted(date_folders, reverse=True)[0]
         full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
 
-        # FIX: Search for files STARTING WITH '会议记录_' and ending in EITHER .md or .txt
         record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and (f.endswith('.md') or f.endswith('.txt'))]
         if not record_files:
-            # FIX: Updated debug message for clarity.
             return None, f"No files starting with '会议记录_' (.md or .txt) found in '{full_folder_path}'."
         
         latest_record_file = sorted(record_files, reverse=True)[0]
