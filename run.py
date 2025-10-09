@@ -384,7 +384,7 @@ def change_audio_source(device_name):
     return "Start"
 
 def find_latest_fixed_text_file():
-    """Finds the most recent '会议记录_*.md' file in the output directories."""
+    """Finds the most recent '会议记录_*.md' or '*.txt' file in the output directories."""
     try:
         date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
         if not date_folders:
@@ -393,12 +393,11 @@ def find_latest_fixed_text_file():
         latest_date_folder = sorted(date_folders, reverse=True)[0]
         full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
 
-        # FIX: Ensure the search is for files STARTING WITH the specific string.
-        # This logic was already correct, but the debug message below is improved for clarity.
-        record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and f.endswith('.md')]
+        # FIX: Search for files STARTING WITH '会议记录_' and ending in EITHER .md or .txt
+        record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and (f.endswith('.md') or f.endswith('.txt'))]
         if not record_files:
-            # FIX: Make the debug message more specific to help diagnose file-not-found issues.
-            return None, f"No files starting with '会议记录_' found in '{full_folder_path}'."
+            # FIX: Updated debug message for clarity.
+            return None, f"No files starting with '会议记录_' (.md or .txt) found in '{full_folder_path}'."
         
         latest_record_file = sorted(record_files, reverse=True)[0]
         
@@ -435,7 +434,7 @@ def summarize_session():
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
             if fixed_text.strip():
-                debug_queue.put("[UI] Summarize triggered. Sending full fixed text for summary.")
+                debug_queue.put("[UI] Summarize triggered. Sending full text for summary.")
                 threading.Thread(target=call_gemini_api, kwargs={
                     'prompt_text': fixed_text, 
                     'system_prompt_file': 'summarize_prompt.md', 
@@ -446,9 +445,9 @@ def summarize_session():
                     'overwrite_file': True
                 }).start()
             else:
-                debug_queue.put("[WARN] No fixed text available to summarize.")
+                debug_queue.put("[WARN] No text available to summarize in the source file.")
         except FileNotFoundError:
-            debug_queue.put(f"[ERROR] Fixed text file not found: {fixed_text_filepath}")
+            debug_queue.put(f"[ERROR] Source file for summary not found: {fixed_text_filepath}")
 
 
 # --- Gradio UI Output Generators ---
