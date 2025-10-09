@@ -28,7 +28,7 @@
 # 1. Go to the Pandoc website: https://pandoc.org/installing.html
 # 2. Download and run the installer for Windows.
 # 3. The installer will usually add Pandoc to your system's PATH automatically.
-#
+# 
 
 # --- Imports ---
 import sounddevice as sd
@@ -337,6 +337,8 @@ def stop_transcription():
 
     def final_sequence():
         """Runs in a background thread to perform final processing steps."""
+        global session_fixed_filename, session_summary_filename
+        
         prompt_to_fix = ""
         with gemini_api_lock:
             global text_buffer
@@ -355,7 +357,6 @@ def stop_transcription():
 
         summarize_session()
         
-        global session_fixed_filename, session_summary_filename
         session_fixed_filename, session_summary_filename = None, None
         debug_queue.put("[UI] Session ended.")
     
@@ -392,9 +393,12 @@ def find_latest_fixed_text_file():
         latest_date_folder = sorted(date_folders, reverse=True)[0]
         full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
 
+        # FIX: Ensure the search is for files STARTING WITH the specific string.
+        # This logic was already correct, but the debug message below is improved for clarity.
         record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and f.endswith('.md')]
         if not record_files:
-            return None, f"No '会议记录' files found in '{full_folder_path}'."
+            # FIX: Make the debug message more specific to help diagnose file-not-found issues.
+            return None, f"No files starting with '会议记录_' found in '{full_folder_path}'."
         
         latest_record_file = sorted(record_files, reverse=True)[0]
         
@@ -409,7 +413,6 @@ def summarize_session():
         fixed_text_filepath = session_fixed_filename
         summary_output_filepath = session_summary_filename
 
-        # If there is no active session, find the latest file from disk.
         if not fixed_text_filepath:
             debug_queue.put("[UI] No active session. Searching for the latest '会议记录' file...")
             latest_file, error_msg = find_latest_fixed_text_file()
@@ -418,7 +421,6 @@ def summarize_session():
                 return
             
             fixed_text_filepath = latest_file
-            # Create a new summary filename in the same directory.
             timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
             summary_fn = f"会议总结_{timestamp_str}.md"
             summary_output_filepath = os.path.join(os.path.dirname(fixed_text_filepath), summary_fn)
