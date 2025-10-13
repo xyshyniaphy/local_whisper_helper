@@ -19,36 +19,26 @@ OUTPUT_DIR = Path("converted_markdown")
 
 def _clean_converted_text(raw_text: str) -> str:
     """
-    A single, common function to perform all cleaning operations on raw extracted text.
+    A common function to clean raw text.
     - Removes all forms of links and URLs.
-    - Aggressively removes all whitespace from each line.
+    - Removes ALL inline whitespace (standard and Chinese) but PRESERVES newlines.
     """
-    # First, remove all types of links from the entire text block.
-    # 1. Remove Pandoc Markdown links: [text](url) -> text
+    # 1. Remove all types of links from the entire text block.
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_text)
-    # 2. Remove raw URLs (http, https, ftp)
     text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
-    # 3. Remove www. links
     text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
-    # 4. Remove email addresses
     text = re.sub(r'\S+@\S+\.\S+', '', text)
 
-    # Second, perform aggressive line-by-line whitespace removal.
-    cleaned_lines = []
-    for line in text.split('\n'):
-        # Use regex to remove all whitespace characters (\s matches spaces, tabs, Unicode spaces, etc.)
-        cleaned_line = re.sub(r'\s+', '', line)
-        
-        # Only keep lines that still have content after cleaning.
-        if cleaned_line:
-            cleaned_lines.append(cleaned_line)
+    # 2. Remove all whitespace characters EXCEPT for newlines.
+    # The regex '[^\S\n]+' targets any character that is not a non-whitespace character
+    # and is not a newline. This effectively removes all spaces, tabs, etc.
+    text = re.sub(r'[^\S\n]+', '', text)
             
-    return '\n'.join(cleaned_lines)
+    return text
 
 def convert_with_pandoc(source_path: Path) -> str:
     """
     Converts DOCX, DOC, and EPUB files to raw Markdown using pypandoc.
-    This function ONLY performs the conversion; cleaning is handled separately.
     """
     file_type = source_path.suffix.upper()[1:]
     print(f"      -> Using pypandoc for {file_type} conversion...")
@@ -59,8 +49,7 @@ def convert_with_pandoc(source_path: Path) -> str:
 
 def convert_pdf_with_pymupdf(source_path: Path) -> str:
     """
-    Extracts raw text from a PDF file using PyMuPDF.
-    This function ONLY performs the extraction; cleaning is handled separately.
+    Extracts raw text from a PDF file, preserving its internal newlines.
     """
     print("      -> Using PyMuPDF for PDF text extraction...")
     full_text = ""
@@ -68,7 +57,9 @@ def convert_pdf_with_pymupdf(source_path: Path) -> str:
         with fitz.open(source_path) as doc:
             num_pages = len(doc)
             for page in doc:
-                full_text += page.get_text() + "\n"
+                # Concatenate text from each page directly
+                full_text += page.get_text()
+        
         print(f"      -> PDF text extracted from {num_pages} pages.")
         return full_text
     except Exception as e:
@@ -80,6 +71,7 @@ def convert_pdf_with_pymupdf(source_path: Path) -> str:
 def split_and_aggregate_by_lesson(md_file_path: Path):
     """
     Reads a pre-cleaned markdown file and aggregates content by lesson markers.
+    The lesson markers themselves are NOT included in the final output.
     """
     print(f"   -> Aggregating content by lesson markers in '{md_file_path.name}'...")
     lesson_pattern = re.compile(r"^(第.*课)$")
@@ -92,14 +84,18 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
         current_lesson_key = "_introduction" 
 
         for line in lines:
-            clean_line = line.strip()
-            match = lesson_pattern.match(clean_line)
+            # The line has no inline whitespace, just content and a newline.
+            stripped_line = line.strip()
+            match = lesson_pattern.match(stripped_line)
             
             if match:
-                safe_key = re.sub(r'[\\/*?:"<>|]', "", clean_line)
+                # This is a marker line. Use the clean line as the key.
+                safe_key = re.sub(r'[\\/*?:"<>|]', "", stripped_line)
                 current_lesson_key = safe_key
-            
-            lessons[current_lesson_key].append(line)
+                # DO NOT append the marker line itself to the content.
+            else:
+                # This is a content line. Append it (with its newline) to the current lesson.
+                lessons[current_lesson_key].append(line)
         
         if len(lessons) <= 1 and "_introduction" in lessons:
             print("   -> No lesson markers found. No aggregation performed.")
