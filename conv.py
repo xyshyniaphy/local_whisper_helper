@@ -15,20 +15,28 @@ SOURCE_DIR = Path("source_files")
 # The original folder structure from SOURCE_DIR will be replicated here.
 OUTPUT_DIR = Path("converted_markdown")
 
-# --- 1. HELPER AND CONVERSION FUNCTIONS ---
+# --- 1. COMMON CLEANING AND CONVERSION FUNCTIONS ---
 
-def _clean_and_remove_all_whitespace(text: str) -> str:
+def _clean_converted_text(raw_text: str) -> str:
     """
-    Aggressively cleans text by removing all whitespace from each line.
-    - Splits text into lines.
-    - For each line, removes ALL whitespace characters (spaces, tabs, Unicode spaces).
-    - Discards any line that becomes empty after cleaning (e.g., blank lines, page numbers).
-    - Joins the cleaned, non-empty lines back together.
+    A single, common function to perform all cleaning operations on raw extracted text.
+    - Removes all forms of links and URLs.
+    - Aggressively removes all whitespace from each line.
     """
+    # First, remove all types of links from the entire text block.
+    # 1. Remove Pandoc Markdown links: [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_text)
+    # 2. Remove raw URLs (http, https, ftp)
+    text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
+    # 3. Remove www. links
+    text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
+    # 4. Remove email addresses
+    text = re.sub(r'\S+@\S+\.\S+', '', text)
+
+    # Second, perform aggressive line-by-line whitespace removal.
     cleaned_lines = []
     for line in text.split('\n'):
-        # Use regex to remove all whitespace characters (\s matches spaces, tabs, newlines, etc.)
-        # This also handles Chinese full-width spaces.
+        # Use regex to remove all whitespace characters (\s matches spaces, tabs, Unicode spaces, etc.)
         cleaned_line = re.sub(r'\s+', '', line)
         
         # Only keep lines that still have content after cleaning.
@@ -39,19 +47,20 @@ def _clean_and_remove_all_whitespace(text: str) -> str:
 
 def convert_with_pandoc(source_path: Path) -> str:
     """
-    Converts DOCX, DOC, and EPUB files to clean Markdown using pypandoc.
+    Converts DOCX, DOC, and EPUB files to raw Markdown using pypandoc.
+    This function ONLY performs the conversion; cleaning is handled separately.
     """
     file_type = source_path.suffix.upper()[1:]
     print(f"      -> Using pypandoc for {file_type} conversion...")
     extra_args = ['--no-highlight', '--strip-comments', '--extract-media=""', '--wrap=none']
     markdown_string = pypandoc.convert_file(str(source_path), to='gfm', extra_args=extra_args)
-    cleaned_markdown = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', markdown_string)
     print(f"      -> {file_type} converted.")
-    return cleaned_markdown
+    return markdown_string
 
 def convert_pdf_with_pymupdf(source_path: Path) -> str:
     """
     Extracts raw text from a PDF file using PyMuPDF.
+    This function ONLY performs the extraction; cleaning is handled separately.
     """
     print("      -> Using PyMuPDF for PDF text extraction...")
     full_text = ""
@@ -60,13 +69,8 @@ def convert_pdf_with_pymupdf(source_path: Path) -> str:
             num_pages = len(doc)
             for page in doc:
                 full_text += page.get_text() + "\n"
-        
-        cleaned_text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', full_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', cleaned_text, flags=re.IGNORECASE)
-        cleaned_text = re.sub(r'\S+@\S+\.\S+', '', cleaned_text)
-
         print(f"      -> PDF text extracted from {num_pages} pages.")
-        return cleaned_text
+        return full_text
     except Exception as e:
         print(f"      -> Error during PDF processing: {e}")
         raise
@@ -88,17 +92,13 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
         current_lesson_key = "_introduction" 
 
         for line in lines:
-            # The line is already stripped of all whitespace by the cleaning function.
-            # We just need to remove the trailing newline character for matching.
             clean_line = line.strip()
             match = lesson_pattern.match(clean_line)
             
             if match:
-                # The matched line is already clean and can be used as the key.
                 safe_key = re.sub(r'[\\/*?:"<>|]', "", clean_line)
                 current_lesson_key = safe_key
             
-            # Append the original line (with its newline) to the content list.
             lessons[current_lesson_key].append(line)
         
         if len(lessons) <= 1 and "_introduction" in lessons:
@@ -112,7 +112,6 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
         for key, content_lines in lessons.items():
             content = "".join(content_lines)
             
-            # Don't save if the final content is empty.
             if not content.strip():
                 continue
 
@@ -130,22 +129,21 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
 
 def convert_file(source_path: Path, output_path: Path) -> bool:
     """
-    Dispatcher function that routes a file to the correct conversion utility,
-    then applies the aggressive whitespace cleaning before saving.
+    Dispatcher function that gets raw text and calls the common cleaning function.
     """
     file_suffix = source_path.suffix.lower()
-    markdown_content = ""
+    raw_content = ""
 
     if file_suffix in ['.doc', '.docx', '.epub']:
-        markdown_content = convert_with_pandoc(source_path)
+        raw_content = convert_with_pandoc(source_path)
     elif file_suffix == '.pdf':
-        markdown_content = convert_pdf_with_pymupdf(source_path)
+        raw_content = convert_pdf_with_pymupdf(source_path)
     else:
         print(f"      -> Unsupported file type: '{file_suffix}'. Skipping.")
         return False
 
-    # Apply the aggressive whitespace removal.
-    final_content = _clean_and_remove_all_whitespace(markdown_content)
+    # Call the single, common cleaning function on the raw output.
+    final_content = _clean_converted_text(raw_content)
     
     output_path.write_text(final_content, encoding='utf-8')
     return True
@@ -168,3 +166,48 @@ def batch_process_directory(source_dir: Path, output_dir: Path):
 
     if not source_files:
         print("No supported files found to process.")
+        return
+
+    total_files = len(source_files)
+    print(f"✅ Found {total_files} file(s) to process.")
+    
+    success_count, failure_count = 0, 0
+
+    for i, source_path in enumerate(source_files, 1):
+        print(f"\n[{i}/{total_files}] Processing: '{source_path}'")
+
+        try:
+            relative_path = source_path.relative_to(source_dir)
+            output_md_path = output_dir / relative_path.with_suffix(".md")
+            output_md_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            print(f"   -> Converting to: '{output_md_path}'")
+            conversion_success = convert_file(source_path, output_md_path)
+
+            if conversion_success:
+                split_and_aggregate_by_lesson(output_md_path)
+                print(f"   ✅ Successfully processed '{source_path.name}'.")
+                success_count += 1
+            else:
+                failure_count += 1
+
+        except Exception as e:
+            print(f"   ❌ FATAL ERROR processing '{source_path.name}'.")
+            print(f"      Error Type: {type(e).__name__}, Message: {e}")
+            traceback.print_exc()
+            failure_count += 1
+
+    print("\n" + "-" * 30)
+    print(f"Batch summary for '{source_dir}':")
+    print(f"   - Success: {success_count}")
+    print(f"   - Failures: {failure_count}")
+    print("-" * 30)
+
+def main():
+    """Main entry point for the script."""
+    print("Starting document conversion and aggregation process...")
+    batch_process_directory(SOURCE_DIR, OUTPUT_DIR)
+    print("\nAll processing complete.")
+
+if __name__ == "__main__":
+    main()
