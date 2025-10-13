@@ -14,7 +14,7 @@ uv cache dir
 
 echo.
 echo Starting the transcription script (run.py)...
-python run.py
+python conv.py
 
 echo.
 echo Script has finished or was exited. Press any key to close this window.
