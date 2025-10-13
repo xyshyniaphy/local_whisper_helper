@@ -19,22 +19,34 @@ OUTPUT_DIR = Path("converted_markdown")
 
 def _clean_converted_text(raw_text: str) -> str:
     """
-    A common function to clean raw text.
-    - Removes all forms of links and URLs.
-    - Removes ALL inline whitespace (standard and Chinese) but PRESERVES newlines.
+    A common function to clean raw text in two stages.
+    - Stage 1: Removes links and all inline whitespace (preserving newlines).
+    - Stage 2: Replaces lines containing only numbers (page numbers) with a blank line.
     """
-    # 1. Remove all types of links from the entire text block.
+    # Stage 1: Perform block-level cleaning first.
+    # 1a. Remove all types of links from the entire text block.
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_text)
     text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\S+@\S+\.\S+', '', text)
 
-    # 2. Remove all whitespace characters EXCEPT for newlines.
-    # The regex '[^\S\n]+' targets any character that is not a non-whitespace character
-    # and is not a newline. This effectively removes all spaces, tabs, etc.
+    # 1b. Remove all whitespace characters EXCEPT for newlines.
     text = re.sub(r'[^\S\n]+', '', text)
+    
+    # Stage 2: Process line-by-line to handle page numbers.
+    lines = text.split('\n')
+    processed_lines = []
+    for line in lines:
+        # Check if the line consists ONLY of digits.
+        if line.isdigit():
+            # Replace the page number line with an empty string.
+            # When joined, this will become a blank line.
+            processed_lines.append('')
+        else:
+            # Keep the original line.
+            processed_lines.append(line)
             
-    return text
+    return '\n'.join(processed_lines)
 
 def convert_with_pandoc(source_path: Path) -> str:
     """
@@ -84,17 +96,13 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
         current_lesson_key = "_introduction" 
 
         for line in lines:
-            # The line has no inline whitespace, just content and a newline.
             stripped_line = line.strip()
             match = lesson_pattern.match(stripped_line)
             
             if match:
-                # This is a marker line. Use the clean line as the key.
                 safe_key = re.sub(r'[\\/*?:"<>|]', "", stripped_line)
                 current_lesson_key = safe_key
-                # DO NOT append the marker line itself to the content.
             else:
-                # This is a content line. Append it (with its newline) to the current lesson.
                 lessons[current_lesson_key].append(line)
         
         if len(lessons) <= 1 and "_introduction" in lessons:
@@ -138,7 +146,6 @@ def convert_file(source_path: Path, output_path: Path) -> bool:
         print(f"      -> Unsupported file type: '{file_suffix}'. Skipping.")
         return False
 
-    # Call the single, common cleaning function on the raw output.
     final_content = _clean_converted_text(raw_content)
     
     output_path.write_text(final_content, encoding='utf-8')
