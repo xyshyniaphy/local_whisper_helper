@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 output/
+source_files/
 pdfs/
 epubs/
 .Python
