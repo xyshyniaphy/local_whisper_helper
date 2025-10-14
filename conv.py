@@ -50,7 +50,7 @@ def _clean_converted_text(raw_text: str) -> str:
 
 def convert_with_pandoc(source_path: Path) -> str:
     """
-    Converts DOCX, DOC, and EPUB files to raw Markdown using pypandoc.
+    Converts DOCX, DOC, EPUB, and HTML files to raw Markdown using pypandoc.
     """
     file_type = source_path.suffix.upper()[1:]
     print(f"      -> Using pypandoc for {file_type} conversion...")
@@ -138,7 +138,7 @@ def convert_file(source_path: Path, output_path: Path) -> bool:
     file_suffix = source_path.suffix.lower()
     raw_content = ""
 
-    if file_suffix in ['.doc', '.docx', '.epub']:
+    if file_suffix in ['.doc', '.docx', '.epub', '.html']:
         raw_content = convert_with_pandoc(source_path)
     elif file_suffix == '.pdf':
         raw_content = convert_pdf_with_pymupdf(source_path)
@@ -164,7 +164,8 @@ def batch_process_directory(source_dir: Path, output_dir: Path):
     print(f"Processing files in: '{source_dir.resolve()}'")
     print("=" * 60)
 
-    supported_patterns = ["*.doc", "*.docx", "*.pdf", "*.epub"]
+    # Find all supported files recursively, now including HTML
+    supported_patterns = ["*.doc", "*.docx", "*.pdf", "*.epub", "*.html"]
     source_files = [p for pattern in supported_patterns for p in source_dir.rglob(pattern)]
 
     if not source_files:
