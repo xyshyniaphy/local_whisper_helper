@@ -8,44 +8,41 @@ from collections import defaultdict
 
 # --- CONFIGURATION ---
 # Define a SINGLE source directory for all input files.
-# The script will recursively search for files within this directory.
 SOURCE_DIR = Path("source_files")
 
 # Define the single output directory for all converted and split files.
-# The original folder structure from SOURCE_DIR will be replicated here.
 OUTPUT_DIR = Path("converted_markdown")
 
-# --- 1. COMMON CLEANING AND CONVERSION FUNCTIONS ---
+# --- 1. HELPER, CLEANING, AND CONVERSION FUNCTIONS ---
+
+def _sanitize_filename_part(name: str, max_length: int = 100) -> str:
+    """
+    Removes illegal characters from a string to make it a valid filename part.
+    """
+    # Remove illegal characters for Windows/Linux/macOS filenames
+    sanitized = re.sub(r'[\\/*?:"<>|]', "", name)
+    # Trim leading/trailing whitespace that might have been missed
+    sanitized = sanitized.strip()
+    # Truncate to a reasonable length
+    return sanitized[:max_length]
 
 def _clean_converted_text(raw_text: str) -> str:
     """
     A common function to clean raw text in three stages.
-    - Stage 1: Removes links and URLs.
-    - Stage 2: Uses regex to remove any remaining HTML tags from the Markdown text.
-    - Stage 3: Removes inline whitespace and replaces page numbers with blank lines.
     """
-    # Stage 1: Perform initial block-level cleaning for links.
+    # Stage 1: Remove links and URLs.
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_text)
     text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\S+@\S+\.\S+', '', text)
 
-    # Stage 2: Use a regular expression to strip all HTML-like tags.
-    # This is the correct way to handle tags within a plain text/Markdown file.
+    # Stage 2: Use regex to remove any remaining HTML tags.
     text = re.sub(r'<[^>]+>', '', text)
 
-    # Stage 3: Process the tag-free text line-by-line for final cleanup.
-    # 3a. Remove all whitespace characters EXCEPT for newlines.
-    text = re.sub(r'[^\S\n]+', '', text)
-    
-    # 3b. Handle page numbers.
+    # Stage 3: Process line-by-line for final cleanup.
+    text = re.sub(r'[^\S\n]+', '', text) # Remove inline whitespace
     lines = text.split('\n')
-    processed_lines = []
-    for line in lines:
-        if line.isdigit():
-            processed_lines.append('') # Replace page number with a blank line
-        else:
-            processed_lines.append(line)
+    processed_lines = [ '' if line.isdigit() else line for line in lines ]
             
     return '\n'.join(processed_lines)
 
@@ -83,7 +80,6 @@ def convert_pdf_with_pymupdf(source_path: Path) -> str:
 def split_and_aggregate_by_lesson(md_file_path: Path):
     """
     Reads a pre-cleaned markdown file and aggregates content by lesson markers.
-    The lesson markers themselves are NOT included in the final output.
     """
     print(f"   -> Aggregating content by lesson markers in '{md_file_path.name}'...")
     lesson_pattern = re.compile(r"^(第.*课)$")
@@ -115,13 +111,10 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
 
         for key, content_lines in lessons.items():
             content = "".join(content_lines)
-            
             if not content.strip():
                 continue
-
             new_filename = f"{base_name}_{key}.md"
             output_path = output_dir / new_filename
-            
             output_path.write_text(content, encoding='utf-8')
             print(f"      - Saved aggregated file: '{output_path.name}'")
             
@@ -131,12 +124,13 @@ def split_and_aggregate_by_lesson(md_file_path: Path):
 
 # --- 3. MAIN DISPATCHER AND BATCH PROCESSING ---
 
-def convert_file(source_path: Path, output_path: Path) -> bool:
+def convert_file(source_path: Path, output_path: Path) -> tuple[bool, str]:
     """
-    Dispatcher function that gets raw text and calls the common cleaning function.
+    Dispatcher that gets raw text, calls the cleaner, saves the file,
+    and returns the success status and final content.
     """
-    file_suffix = source_path.suffix.lower()
     raw_content = ""
+    file_suffix = source_path.suffix.lower()
 
     if file_suffix in ['.doc', '.docx', '.epub', '.html']:
         raw_content = convert_with_pandoc(source_path)
@@ -144,17 +138,15 @@ def convert_file(source_path: Path, output_path: Path) -> bool:
         raw_content = convert_pdf_with_pymupdf(source_path)
     else:
         print(f"      -> Unsupported file type: '{file_suffix}'. Skipping.")
-        return False
+        return False, ""
 
     final_content = _clean_converted_text(raw_content)
-    
     output_path.write_text(final_content, encoding='utf-8')
-    return True
+    return True, final_content
 
 def batch_process_directory(source_dir: Path, output_dir: Path):
     """
-    Main batch processing loop. It finds all supported files in a source
-    directory, converts them, and then attempts to aggregate them.
+    Main batch processing loop with conditional output filename logic.
     """
     if not source_dir.is_dir():
         print(f"⚠️  Error: Source directory not found at '{source_dir}'. Please create it and add files.")
@@ -181,14 +173,33 @@ def batch_process_directory(source_dir: Path, output_dir: Path):
 
         try:
             relative_path = source_path.relative_to(source_dir)
-            output_md_path = output_dir / relative_path.with_suffix(".md")
-            output_md_path.parent.mkdir(parents=True, exist_ok=True)
+            initial_output_path = output_dir / relative_path.with_suffix(".md")
+            initial_output_path.parent.mkdir(parents=True, exist_ok=True)
             
-            print(f"   -> Converting to: '{output_md_path}'")
-            conversion_success = convert_file(source_path, output_md_path)
+            print(f"   -> Converting to: '{initial_output_path}'")
+            conversion_success, final_content = convert_file(source_path, initial_output_path)
 
             if conversion_success:
-                split_and_aggregate_by_lesson(output_md_path)
+                final_md_path = initial_output_path
+
+                # NEW: Conditional filename logic
+                if source_path.name.startswith("ZB"):
+                    # Get the first line of the cleaned content as a prefix
+                    first_line = final_content.split('\n', 1)[0] if final_content else ""
+                    prefix = _sanitize_filename_part(first_line)
+
+                    if prefix:
+                        # Construct the new filename and path
+                        new_name = f"{prefix}_{initial_output_path.stem}{initial_output_path.suffix}"
+                        new_path = initial_output_path.with_name(new_name)
+                        
+                        # Rename the file that was just saved
+                        initial_output_path.rename(new_path)
+                        print(f"   -> Renamed to: '{new_path.name}'")
+                        final_md_path = new_path # Use the new path for aggregation
+
+                # Call the aggregation function with the correct final path
+                split_and_aggregate_by_lesson(final_md_path)
                 print(f"   ✅ Successfully processed '{source_path.name}'.")
                 success_count += 1
             else:
