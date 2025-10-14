@@ -144,8 +144,12 @@ def convert_md_to_docx(md_filepath):
         debug_queue.put(f"[ERROR] An unexpected error occurred during DOCX conversion: {e}")
 
 
-def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename, output_queue, analysis_type, overwrite_file=False):
-    """A generalized function to call the Gemini API for different tasks."""
+def call_gemini_api(prompt_text, model_name, output_filename, output_queue, analysis_type, system_prompt_file=None, system_prompt_text=None, overwrite_file=False):
+    """
+    A generalized function to call the Gemini API for different tasks.
+    It can take the system prompt either from a file (system_prompt_file) or directly as a string (system_prompt_text).
+    The direct string `system_prompt_text` takes precedence if provided.
+    """
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
     config = load_config()
     api_host, api_key = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY")
@@ -153,10 +157,19 @@ def call_gemini_api(prompt_text, system_prompt_file, model_name, output_filename
         debug_queue.put("[ERROR] Gemini API credentials not found.")
         return
 
-    try:
-        with open(system_prompt_file, 'r', encoding='utf-8') as f: system_prompt = f.read()
-    except FileNotFoundError:
-        debug_queue.put(f"[ERROR] System prompt file not found: {system_prompt_file}")
+    system_prompt = ""
+    if system_prompt_text:
+        system_prompt = system_prompt_text
+    elif system_prompt_file:
+        try:
+            with open(system_prompt_file, 'r', encoding='utf-8') as f:
+                system_prompt = f.read()
+        except FileNotFoundError:
+            debug_queue.put(f"[ERROR] System prompt file not found: {system_prompt_file}")
+            return
+    
+    if not system_prompt:
+        debug_queue.put(f"[ERROR] System prompt for {analysis_type} is empty. Aborting API call.")
         return
 
     url = f"{api_host}/models/{model_name}:generateContent?key={api_key}"
@@ -206,8 +219,9 @@ def send_and_reset_log(on_complete=None):
             def api_call_with_callback():
                 """Wrapper to run the API call and an optional callback upon completion."""
                 call_gemini_api(
-                    prompt, 'system_prompt.md', 'gemini-flash-latest-non-thinking', 
-                    session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
+                    prompt, 'gemini-flash-latest-non-thinking', 
+                    session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
+                    system_prompt_file='system_prompt.md'
                 )
                 if on_complete:
                     time.sleep(2) 
@@ -344,8 +358,9 @@ def stop_transcription():
         if prompt_to_fix.strip():
             debug_queue.put("[INFO] Processing final text chunk before summarizing...")
             call_gemini_api(
-                prompt_to_fix, 'system_prompt.md', 'gemini-flash-latest-non-thinking', 
-                session_fixed_filename, fixed_text_output_queue, 'Fixed Text'
+                prompt_to_fix, 'gemini-flash-latest-non-thinking', 
+                session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
+                system_prompt_file='system_prompt.md'
             )
             time.sleep(2)
         else:
@@ -400,9 +415,12 @@ def find_latest_fixed_text_file():
         return None, f"Error finding latest file: {e}"
 
 def summarize_session():
-    """Handles the 'Summarize' button. Summarizes active session or latest file."""
+    """
+    Handles the 'Summarize' button. Summarizes active session or latest file.
+    This function now reads `context.md` and embeds it into the user prompt,
+    along with the main text to be summarized. `summarize_prompt.md` is used as the system prompt.
+    """
     with gemini_api_lock:
-        
         fixed_text_filepath = session_fixed_filename
         summary_output_filepath = session_summary_filename
 
@@ -425,13 +443,43 @@ def summarize_session():
             return
 
         try:
+            # 1. Read the main content to be summarized
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
-                fixed_text = f.read()
-            if fixed_text.strip():
-                debug_queue.put("[UI] Summarize triggered. Sending full text for summary.")
+                main_text_to_summarize = f.read()
+
+            # 2. Read the system prompt from its file
+            system_prompt = ""
+            try:
+                with open('summarize_prompt.md', 'r', encoding='utf-8') as f:
+                    system_prompt = f.read()
+            except FileNotFoundError:
+                debug_queue.put("[ERROR] 'summarize_prompt.md' is missing. Cannot generate summary.")
+                return
+
+            # 3. Read the context to be embedded in the user prompt
+            context_for_user_prompt = ""
+            try:
+                with open('context.md', 'r', encoding='utf-8') as f:
+                    context_for_user_prompt = f.read()
+            except FileNotFoundError:
+                debug_queue.put("[WARN] 'context.md' not found. Summarizing without it.")
+
+            # 4. Combine context and main text into the final user prompt.
+            # The structure is important for the LLM to understand the different parts.
+            final_user_prompt = (
+                "Please perform your task based on the following information.\n\n"
+                "### CONTEXT ###\n"
+                f"{context_for_user_prompt}\n\n"
+                "### TEXT TO PROCESS ###\n"
+                f"{main_text_to_summarize}"
+            )
+            
+            # 5. Call the API if there's text to summarize
+            if main_text_to_summarize.strip():
+                debug_queue.put("[UI] Summarize triggered. Sending text for summary with context embedded in user prompt.")
                 threading.Thread(target=call_gemini_api, kwargs={
-                    'prompt_text': fixed_text, 
-                    'system_prompt_file': 'summarize_prompt.md', 
+                    'prompt_text': final_user_prompt,
+                    'system_prompt_text': system_prompt,
                     'model_name': 'gemini-flash-latest-non-thinking',
                     'output_filename': summary_output_filepath, 
                     'output_queue': summary_output_queue, 
@@ -528,4 +576,3 @@ if __name__ == "__main__":
 
     exit_event.set()
     restart_stream_event.set()
-
