@@ -199,7 +199,7 @@ def batch_process_directory(source_dir: Path, output_dir: Path):
                         final_md_path = new_path # Use the new path for aggregation
 
                 # Call the aggregation function with the correct final path
-                split_and_aggregate_by_lesson(final_md_path)
+                #split_and_aggregate_by_lesson(final_md_path)
                 print(f"   ✅ Successfully processed '{source_path.name}'.")
                 success_count += 1
             else:
