@@ -5,6 +5,7 @@ import fitz  # PyMuPDF
 from pathlib import Path
 import traceback
 from collections import defaultdict
+from bs4 import BeautifulSoup
 
 # --- CONFIGURATION ---
 # Define a SINGLE source directory for all input files.
@@ -19,31 +20,33 @@ OUTPUT_DIR = Path("converted_markdown")
 
 def _clean_converted_text(raw_text: str) -> str:
     """
-    A common function to clean raw text in two stages.
-    - Stage 1: Removes links and all inline whitespace (preserving newlines).
-    - Stage 2: Replaces lines containing only numbers (page numbers) with a blank line.
+    A common function to clean raw text in three stages.
+    - Stage 1: Removes links and URLs.
+    - Stage 2: Uses BeautifulSoup to remove all HTML tags.
+    - Stage 3: Removes inline whitespace and replaces page numbers with blank lines.
     """
-    # Stage 1: Perform block-level cleaning first.
-    # 1a. Remove all types of links from the entire text block.
+    # Stage 1: Perform initial block-level cleaning for links.
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', raw_text)
     text = re.sub(r'(https?|ftp)://[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\S+@\S+\.\S+', '', text)
 
-    # 1b. Remove all whitespace characters EXCEPT for newlines.
+    # Stage 2: Use BeautifulSoup to strip all HTML tags.
+    # We use the 'lxml' parser for speed and robustness.
+    soup = BeautifulSoup(text, 'lxml')
+    text = soup.get_text()
+
+    # Stage 3: Process the tag-free text line-by-line for final cleanup.
+    # 3a. Remove all whitespace characters EXCEPT for newlines.
     text = re.sub(r'[^\S\n]+', '', text)
     
-    # Stage 2: Process line-by-line to handle page numbers.
+    # 3b. Handle page numbers.
     lines = text.split('\n')
     processed_lines = []
     for line in lines:
-        # Check if the line consists ONLY of digits.
         if line.isdigit():
-            # Replace the page number line with an empty string.
-            # When joined, this will become a blank line.
-            processed_lines.append('')
+            processed_lines.append('') # Replace page number with a blank line
         else:
-            # Keep the original line.
             processed_lines.append(line)
             
     return '\n'.join(processed_lines)
@@ -69,7 +72,6 @@ def convert_pdf_with_pymupdf(source_path: Path) -> str:
         with fitz.open(source_path) as doc:
             num_pages = len(doc)
             for page in doc:
-                # Concatenate text from each page directly
                 full_text += page.get_text()
         
         print(f"      -> PDF text extracted from {num_pages} pages.")
@@ -164,7 +166,6 @@ def batch_process_directory(source_dir: Path, output_dir: Path):
     print(f"Processing files in: '{source_dir.resolve()}'")
     print("=" * 60)
 
-    # Find all supported files recursively, now including HTML
     supported_patterns = ["*.doc", "*.docx", "*.pdf", "*.epub", "*.html"]
     source_files = [p for pattern in supported_patterns for p in source_dir.rglob(pattern)]
 
