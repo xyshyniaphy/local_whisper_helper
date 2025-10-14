@@ -5,7 +5,6 @@ import fitz  # PyMuPDF
 from pathlib import Path
 import traceback
 from collections import defaultdict
-from bs4 import BeautifulSoup
 
 # --- CONFIGURATION ---
 # Define a SINGLE source directory for all input files.
@@ -22,7 +21,7 @@ def _clean_converted_text(raw_text: str) -> str:
     """
     A common function to clean raw text in three stages.
     - Stage 1: Removes links and URLs.
-    - Stage 2: Uses BeautifulSoup to remove all HTML tags.
+    - Stage 2: Uses regex to remove any remaining HTML tags from the Markdown text.
     - Stage 3: Removes inline whitespace and replaces page numbers with blank lines.
     """
     # Stage 1: Perform initial block-level cleaning for links.
@@ -31,10 +30,9 @@ def _clean_converted_text(raw_text: str) -> str:
     text = re.sub(r'www\.[^\s/$.?#].[^\s]*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\S+@\S+\.\S+', '', text)
 
-    # Stage 2: Use BeautifulSoup to strip all HTML tags.
-    # We use the 'lxml' parser for speed and robustness.
-    soup = BeautifulSoup(text, 'lxml')
-    text = soup.get_text()
+    # Stage 2: Use a regular expression to strip all HTML-like tags.
+    # This is the correct way to handle tags within a plain text/Markdown file.
+    text = re.sub(r'<[^>]+>', '', text)
 
     # Stage 3: Process the tag-free text line-by-line for final cleanup.
     # 3a. Remove all whitespace characters EXCEPT for newlines.
