@@ -74,6 +74,7 @@ VAD_THRESHOLD = 0.5
 daily_output_folder = "" # Will be set to something like 'output/251009'
 session_fixed_filename = None
 session_summary_filename = None
+session_fix_debug_filename = None # ADDED: For fix debug logging
 
 # --- Audio Device Management ---
 device_cycle = []
@@ -124,9 +125,10 @@ def load_config():
         'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY')
     }
 
-def get_review_context(stt_text: str) -> str:
+def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
     """
-    Passes STT text to multiple LLMs via OpenRouter to get review suggestions.
+    Passes STT text to multiple LLMs via OpenRouter to get review suggestions
+    and logs the prompts to the session's fix debug file.
     """
     debug_queue.put("[INFO] Getting STT reviews from helper LLMs...")
     config = load_config()
@@ -152,10 +154,7 @@ def get_review_context(stt_text: str) -> str:
         return ""
 
     all_reviews = []
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     for model_name in model_names:
         debug_queue.put(f"  -> Querying review model: {model_name}")
@@ -166,6 +165,18 @@ def get_review_context(stt_text: str) -> str:
                 {"role": "user", "content": stt_text}
             ]
         }
+        
+        # ADDED: Log the prompt before sending
+        if fix_debug_filename:
+            try:
+                with open(fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
+                    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    dbg_f.write(f"---\n### Review Prompt Sent to: {model_name} at {timestamp}\n\n")
+                    dbg_f.write(f"**System Prompt:**\n```\n{system_prompt}\n```\n\n")
+                    dbg_f.write(f"**User Prompt:**\n```\n{stt_text}\n```\n---\n\n")
+            except IOError as e:
+                debug_queue.put(f"[ERROR] Could not write to fix debug file {fix_debug_filename}: {e}")
+
         try:
             response = requests.post(api_url, headers=headers, json=payload, timeout=60)
             response.raise_for_status()
@@ -236,7 +247,7 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
             
             if analysis_type == 'Summary':
                 content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}"
-            else: # For fixed text, just write the text
+            else:
                 content_to_write = llm_text
 
             if file_mode == 'a':
@@ -269,10 +280,19 @@ def send_and_reset_log(on_complete=None):
             text_buffer = ""
             
             def api_call_with_callback():
-                review_context = get_review_context(prompt)
-                
+                review_context = get_review_context(prompt, session_fix_debug_filename)
                 final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt}"
                 
+                # ADDED: Log the final fix prompt before sending
+                if session_fix_debug_filename:
+                    try:
+                        with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
+                            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            dbg_f.write(f"---\n### Final Fix Prompt Sent to Gemini at {timestamp}\n\n")
+                            dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
+                    except IOError as e:
+                        debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
+
                 call_gemini_api(
                     final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
                     session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
@@ -369,7 +389,7 @@ def main_audio_loop():
 
 def start_pause_transcription(current_status):
     """Handles the Start/Pause button logic."""
-    global session_fixed_filename, session_summary_filename
+    global session_fixed_filename, session_summary_filename, session_fix_debug_filename
     if current_status == "Start":
         if not session_fixed_filename:
             today_str = datetime.datetime.now().strftime("%y%m%d")
@@ -378,15 +398,19 @@ def start_pause_transcription(current_status):
             if not os.path.exists(daily_output_folder):
                 os.makedirs(daily_output_folder)
             
-            timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H")
-            # CORRECTED: Use .txt suffix for the fixed text file
+            # UPDATED: Timestamp now includes minutes for unique debug files per session
+            timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M")
             fixed_fn = f"会议记录_{timestamp_str}.txt"
             summary_fn = f"会议总结_{timestamp_str}.md"
+            fix_debug_fn = f"dbg_fix_{timestamp_str}.md" # ADDED: Debug filename
+
             session_fixed_filename = os.path.join(daily_output_folder, fixed_fn)
             session_summary_filename = os.path.join(daily_output_folder, summary_fn)
+            session_fix_debug_filename = os.path.join(daily_output_folder, fix_debug_fn) # ADDED: Set global debug filename
 
             debug_queue.put(f"New session. Fixed text: '{session_fixed_filename}'")
             debug_queue.put(f"             Summary: '{session_summary_filename}'")
+            debug_queue.put(f"             Fix Debug: '{session_fix_debug_filename}'") # ADDED: Announce debug file
         is_running.set()
         debug_queue.put("[UI] Transcription started.")
         return "Pause"
@@ -402,7 +426,7 @@ def stop_transcription():
     debug_queue.put("[UI] Transcription stopped. Processing final text and generating summary...")
 
     def final_sequence():
-        global session_fixed_filename, session_summary_filename
+        global session_fixed_filename, session_summary_filename, session_fix_debug_filename
         
         prompt_to_fix = ""
         with gemini_api_lock:
@@ -412,9 +436,19 @@ def stop_transcription():
         
         if prompt_to_fix.strip():
             debug_queue.put("[INFO] Processing final text chunk before summarizing...")
-            review_context = get_review_context(prompt_to_fix)
+            review_context = get_review_context(prompt_to_fix, session_fix_debug_filename)
             final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt_to_fix}"
             
+            # ADDED: Log the final fix prompt before sending
+            if session_fix_debug_filename:
+                try:
+                    with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
+                        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        dbg_f.write(f"---\n### Final Fix Prompt Sent to Gemini at {timestamp}\n\n")
+                        dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
+                except IOError as e:
+                    debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
+
             call_gemini_api(
                 final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
                 session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
@@ -426,7 +460,7 @@ def stop_transcription():
 
         summarize_session()
         
-        session_fixed_filename, session_summary_filename = None, None
+        session_fixed_filename, session_summary_filename, session_fix_debug_filename = None, None, None
         debug_queue.put("[UI] Session ended.")
     
     threading.Thread(target=final_sequence).start()
@@ -499,6 +533,29 @@ def summarize_session():
         try:
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
+            
+            # ADDED: Logic to create and write to the summary debug file
+            system_prompt_for_summary = ""
+            try:
+                with open('summarize_prompt.md', 'r', encoding='utf-8') as f:
+                    system_prompt_for_summary = f.read()
+            except FileNotFoundError:
+                debug_queue.put("[ERROR] 'summarize_prompt.md' is missing. Cannot generate summary.")
+                return
+
+            summary_timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+            summary_debug_fn = f"dbg_summary_{summary_timestamp_str}.md"
+            summary_debug_filepath = os.path.join(os.path.dirname(summary_output_filepath), summary_debug_fn)
+            debug_queue.put(f"[INFO] Writing summary prompt to debug file: '{summary_debug_fn}'")
+
+            try:
+                with open(summary_debug_filepath, 'w', encoding='utf-8') as dbg_f:
+                    dbg_f.write(f"### Summary Prompt Sent to Gemini at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    dbg_f.write(f"**System Prompt Used:**\n```\n{system_prompt_for_summary}\n```\n\n")
+                    dbg_f.write(f"**User Prompt Sent:**\n```\n{fixed_text}\n```\n")
+            except IOError as e:
+                debug_queue.put(f"[ERROR] Could not write to summary debug file {summary_debug_filepath}: {e}")
+
             if fixed_text.strip():
                 debug_queue.put("[UI] Summarize triggered. Sending full text for summary.")
                 threading.Thread(target=call_gemini_api, kwargs={
