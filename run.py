@@ -5,7 +5,7 @@
 # It uses the Silero VAD model for intelligent segmentation, improving accuracy.
 # All output files are saved in a date-stamped subfolder (e.g., 'output/251009').
 # Three primary files are created per session:
-#   1. 会议记录_[yymmdd_HH].md: LLM-corrected version of the transcription (appended).
+#   1. 会议记录_[yymmdd_HH].txt: LLM-corrected version of the transcription (appended).
 #   2. 会议总结_[yymmdd_HH].md: LLM-generated summary of the fixed text (overwritten).
 #   3. 会议总结_[yymmdd_HH].docx: A DOCX version of the summary file.
 #
@@ -117,7 +117,69 @@ def find_audio_devices():
 def load_config():
     """Loads configuration from a .env file."""
     load_dotenv()
-    return {'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY')}
+    return {
+        'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 
+        'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY'),
+        'OPEN_ROUTER_API': os.environ.get('OPEN_ROUTER_API'),
+        'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY')
+    }
+
+def get_review_context(stt_text: str) -> str:
+    """
+    Passes STT text to multiple LLMs via OpenRouter to get review suggestions.
+    """
+    debug_queue.put("[INFO] Getting STT reviews from helper LLMs...")
+    config = load_config()
+    api_url = config.get("OPEN_ROUTER_API")
+    api_key = config.get("OPEN_ROUTER_KEY")
+
+    if not all([api_url, api_key]):
+        debug_queue.put("[ERROR] OpenRouter API URL or Key not found in .env file.")
+        return ""
+
+    try:
+        with open('review_llm_ids.txt', 'r', encoding='utf-8') as f:
+            model_names = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        debug_queue.put("[WARN] 'review_llm_ids.txt' not found. Skipping review step.")
+        return ""
+
+    try:
+        with open('review_prompt.md', 'r', encoding='utf-8') as f:
+            system_prompt = f.read()
+    except FileNotFoundError:
+        debug_queue.put("[ERROR] 'review_prompt.md' not found. Cannot get reviews.")
+        return ""
+
+    all_reviews = []
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    for model_name in model_names:
+        debug_queue.put(f"  -> Querying review model: {model_name}")
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": stt_text}
+            ]
+        }
+        try:
+            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            review_text = result['choices'][0]['message']['content']
+            all_reviews.append(review_text)
+            debug_queue.put(f"  -> Success from {model_name}.")
+        except requests.exceptions.RequestException as e:
+            debug_queue.put(f"[ERROR] API call to {model_name} failed: {e}")
+        except (KeyError, IndexError) as e:
+            debug_queue.put(f"[ERROR] Could not parse response from {model_name}: {e}")
+
+    return "\n".join(all_reviews)
+
 
 def convert_md_to_docx(md_filepath):
     """Converts a markdown file to a DOCX file using pypandoc."""
@@ -133,23 +195,14 @@ def convert_md_to_docx(md_filepath):
     debug_queue.put(f"[INFO] Converting summary to DOCX: '{os.path.basename(docx_filepath)}'")
 
     try:
-        # Pypandoc will now find the bundled pandoc executable automatically.
         pypandoc.convert_file(md_filepath, 'docx', outputfile=docx_filepath)
         debug_queue.put(f"[SUCCESS] Successfully created DOCX file: '{os.path.basename(docx_filepath)}'")
-    except OSError as e:
-        # This error is less likely now but kept for robustness.
-        debug_queue.put("[ERROR] Pandoc conversion failed. This might happen if there's a permission issue.")
-        debug_queue.put(f"        Details: {e}")
     except Exception as e:
         debug_queue.put(f"[ERROR] An unexpected error occurred during DOCX conversion: {e}")
 
 
 def call_gemini_api(prompt_text, model_name, output_filename, output_queue, analysis_type, system_prompt_file=None, system_prompt_text=None, overwrite_file=False):
-    """
-    A generalized function to call the Gemini API for different tasks.
-    It can take the system prompt either from a file (system_prompt_file) or directly as a string (system_prompt_text).
-    The direct string `system_prompt_text` takes precedence if provided.
-    """
+    """A generalized function to call the Gemini API for different tasks."""
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
     config = load_config()
     api_host, api_key = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY")
@@ -162,15 +215,10 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
         system_prompt = system_prompt_text
     elif system_prompt_file:
         try:
-            with open(system_prompt_file, 'r', encoding='utf-8') as f:
-                system_prompt = f.read()
+            with open(system_prompt_file, 'r', encoding='utf-8') as f: system_prompt = f.read()
         except FileNotFoundError:
             debug_queue.put(f"[ERROR] System prompt file not found: {system_prompt_file}")
             return
-    
-    if not system_prompt:
-        debug_queue.put(f"[ERROR] System prompt for {analysis_type} is empty. Aborting API call.")
-        return
 
     url = f"{api_host}/models/{model_name}:generateContent?key={api_key}"
     headers = {'Content-Type': 'application/json'}
@@ -185,10 +233,14 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
         file_mode = 'w' if overwrite_file else 'a'
         with open(output_filename, file_mode, encoding='utf-8') as f:
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}"
             
+            if analysis_type == 'Summary':
+                content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}"
+            else: # For fixed text, just write the text
+                content_to_write = llm_text
+
             if file_mode == 'a':
-                f.write(f"\n\n---\n\n{content_to_write}")
+                f.write(f"\n{content_to_write}")
             else:
                 f.write(content_to_write)
         
@@ -217,9 +269,12 @@ def send_and_reset_log(on_complete=None):
             text_buffer = ""
             
             def api_call_with_callback():
-                """Wrapper to run the API call and an optional callback upon completion."""
+                review_context = get_review_context(prompt)
+                
+                final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt}"
+                
                 call_gemini_api(
-                    prompt, 'gemini-flash-latest-non-thinking', 
+                    final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
                     session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
                     system_prompt_file='system_prompt.md'
                 )
@@ -324,7 +379,8 @@ def start_pause_transcription(current_status):
                 os.makedirs(daily_output_folder)
             
             timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H")
-            fixed_fn = f"会议记录_{timestamp_str}.md"
+            # CORRECTED: Use .txt suffix for the fixed text file
+            fixed_fn = f"会议记录_{timestamp_str}.txt"
             summary_fn = f"会议总结_{timestamp_str}.md"
             session_fixed_filename = os.path.join(daily_output_folder, fixed_fn)
             session_summary_filename = os.path.join(daily_output_folder, summary_fn)
@@ -346,7 +402,6 @@ def stop_transcription():
     debug_queue.put("[UI] Transcription stopped. Processing final text and generating summary...")
 
     def final_sequence():
-        """Runs in a background thread to perform final processing steps."""
         global session_fixed_filename, session_summary_filename
         
         prompt_to_fix = ""
@@ -357,8 +412,11 @@ def stop_transcription():
         
         if prompt_to_fix.strip():
             debug_queue.put("[INFO] Processing final text chunk before summarizing...")
+            review_context = get_review_context(prompt_to_fix)
+            final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt_to_fix}"
+            
             call_gemini_api(
-                prompt_to_fix, 'gemini-flash-latest-non-thinking', 
+                final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
                 session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
                 system_prompt_file='system_prompt.md'
             )
@@ -395,7 +453,7 @@ def change_audio_source(device_name):
     return "Start"
 
 def find_latest_fixed_text_file():
-    """Finds the most recent '会议记录_*.md' or '*.txt' file in the output directories."""
+    """Finds the most recent '会议记录_*.txt' file in the output directories."""
     try:
         date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
         if not date_folders:
@@ -404,9 +462,9 @@ def find_latest_fixed_text_file():
         latest_date_folder = sorted(date_folders, reverse=True)[0]
         full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
 
-        record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and (f.endswith('.md') or f.endswith('.txt'))]
+        record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and f.endswith('.txt')]
         if not record_files:
-            return None, f"No files starting with '会议记录_' (.md or .txt) found in '{full_folder_path}'."
+            return None, f"No files starting with '会议记录_' (.txt) found in '{full_folder_path}'."
         
         latest_record_file = sorted(record_files, reverse=True)[0]
         
@@ -415,11 +473,7 @@ def find_latest_fixed_text_file():
         return None, f"Error finding latest file: {e}"
 
 def summarize_session():
-    """
-    Handles the 'Summarize' button. Summarizes active session or latest file.
-    This function now reads `context.md` and embeds it into the user prompt,
-    along with the main text to be summarized. `summarize_prompt.md` is used as the system prompt.
-    """
+    """Handles the 'Summarize' button. Summarizes active session or latest file."""
     with gemini_api_lock:
         fixed_text_filepath = session_fixed_filename
         summary_output_filepath = session_summary_filename
@@ -443,43 +497,13 @@ def summarize_session():
             return
 
         try:
-            # 1. Read the main content to be summarized
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
-                main_text_to_summarize = f.read()
-
-            # 2. Read the system prompt from its file
-            system_prompt = ""
-            try:
-                with open('summarize_prompt.md', 'r', encoding='utf-8') as f:
-                    system_prompt = f.read()
-            except FileNotFoundError:
-                debug_queue.put("[ERROR] 'summarize_prompt.md' is missing. Cannot generate summary.")
-                return
-
-            # 3. Read the context to be embedded in the user prompt
-            context_for_user_prompt = ""
-            try:
-                with open('context.md', 'r', encoding='utf-8') as f:
-                    context_for_user_prompt = f.read()
-            except FileNotFoundError:
-                debug_queue.put("[WARN] 'context.md' not found. Summarizing without it.")
-
-            # 4. Combine context and main text into the final user prompt.
-            # The structure is important for the LLM to understand the different parts.
-            final_user_prompt = (
-                "Please perform your task based on the following information.\n\n"
-                "### CONTEXT ###\n"
-                f"{context_for_user_prompt}\n\n"
-                "### TEXT TO PROCESS ###\n"
-                f"{main_text_to_summarize}"
-            )
-            
-            # 5. Call the API if there's text to summarize
-            if main_text_to_summarize.strip():
-                debug_queue.put("[UI] Summarize triggered. Sending text for summary with context embedded in user prompt.")
+                fixed_text = f.read()
+            if fixed_text.strip():
+                debug_queue.put("[UI] Summarize triggered. Sending full text for summary.")
                 threading.Thread(target=call_gemini_api, kwargs={
-                    'prompt_text': final_user_prompt,
-                    'system_prompt_text': system_prompt,
+                    'prompt_text': fixed_text, 
+                    'system_prompt_file': 'summarize_prompt.md', 
                     'model_name': 'gemini-flash-latest-non-thinking',
                     'output_filename': summary_output_filepath, 
                     'output_queue': summary_output_queue, 
