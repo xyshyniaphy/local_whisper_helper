@@ -188,7 +188,7 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
                 review_text = result['choices'][0]['message']['content']
                 all_reviews.append(review_text)
                 debug_queue.put(f"  -> Success from {model_name}.")
-                break # Success, exit retry loop
+                break 
             except requests.exceptions.RequestException as e:
                 debug_queue.put(f"[ERROR] API call to {model_name} failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
                 if attempt < MAX_RETRIES - 1:
@@ -198,9 +198,8 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
                     debug_queue.put(f"        All retries failed for {model_name}.")
             except (KeyError, IndexError) as e:
                 debug_queue.put(f"[ERROR] Could not parse response from {model_name}: {e}")
-                break # Don't retry on parsing errors
+                break 
 
-        # Proactive delay between calls to different models
         if i < len(model_names) - 1:
             debug_queue.put(f"    Waiting for {delay} seconds before next model...")
             time.sleep(delay)
@@ -271,7 +270,7 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
             if analysis_type == 'Summary':
                 convert_md_to_docx(output_filename)
             
-            return # Success, exit function
+            return 
         except requests.exceptions.RequestException as e:
             debug_queue.put(f"[ERROR] Gemini API call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES - 1:
@@ -281,7 +280,7 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
                 debug_queue.put(f"        All retries failed for Gemini API call.")
         except (KeyError, IndexError) as e:
             debug_queue.put(f"[ERROR] Could not parse Gemini response: {e}")
-            return # Don't retry on parsing errors
+            return 
 
 def send_and_reset_log(on_complete=None):
     """Sends the transcribed text to be fixed by Gemini and resets the buffer."""
@@ -522,7 +521,9 @@ def find_latest_fixed_text_file():
         return None, f"Error finding latest file: {e}"
 
 def summarize_session():
-    """Handles the 'Summarize' button. Summarizes active session or latest file."""
+    """
+    Handles the 'Summarize' button. Re-embeds context.md into the user prompt.
+    """
     with gemini_api_lock:
         fixed_text_filepath = session_fixed_filename
         summary_output_filepath = session_summary_filename
@@ -548,7 +549,18 @@ def summarize_session():
         try:
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
-            
+
+            # --- REVERTED LOGIC: Read context and build the prompt ---
+            context_content = ""
+            try:
+                with open('context.md', 'r', encoding='utf-8') as f:
+                    context_content = f.read()
+            except FileNotFoundError:
+                debug_queue.put("[WARN] 'context.md' not found for summary. Proceeding without it.")
+
+            final_summary_prompt = f'{context_content}\n\n"""TEXT TO PROCESS"""\n\n{fixed_text}'
+            # --- END REVERTED LOGIC ---
+
             summary_timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
             summary_debug_fn = f"dbg_summary_{summary_timestamp_str}.md"
             summary_debug_filepath = os.path.join(os.path.dirname(summary_output_filepath), summary_debug_fn)
@@ -557,14 +569,14 @@ def summarize_session():
             try:
                 with open(summary_debug_filepath, 'w', encoding='utf-8') as dbg_f:
                     dbg_f.write(f"### Summary User Prompt Sent to Gemini at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    dbg_f.write(f"```\n{fixed_text}\n```\n")
+                    dbg_f.write(f"```\n{final_summary_prompt}\n```\n") # Log the correct combined prompt
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not write to summary debug file {summary_debug_filepath}: {e}")
 
             if fixed_text.strip():
-                debug_queue.put("[UI] Summarize triggered. Sending full text for summary.")
+                debug_queue.put("[UI] Summarize triggered. Sending full text for summary with context.")
                 threading.Thread(target=call_gemini_api, kwargs={
-                    'prompt_text': fixed_text, 
+                    'prompt_text': final_summary_prompt, # Send the correct combined prompt
                     'system_prompt_file': 'summarize_prompt.md', 
                     'model_name': 'gemini-flash-latest-non-thinking',
                     'output_filename': summary_output_filepath, 
