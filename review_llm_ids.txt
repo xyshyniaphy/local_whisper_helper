@@ -1,1 +1,2 @@
 tngtech/deepseek-r1t2-chimera:free
+z-ai/glm-4.5-air:free

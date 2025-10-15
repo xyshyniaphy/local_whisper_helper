@@ -69,12 +69,14 @@ SILENCE_DURATION_S = 0.6
 PERIODIC_GEMINI_CALL_S = 300 # 5 minutes
 OUTPUT_FOLDER = "output"
 VAD_THRESHOLD = 0.5
+MAX_RETRIES = 3
+DEFAULT_DELAY_S = 5
 
 # --- File & Session Management ---
 daily_output_folder = "" # Will be set to something like 'output/251009'
 session_fixed_filename = None
 session_summary_filename = None
-session_fix_debug_filename = None # ADDED: For fix debug logging
+session_fix_debug_filename = None
 
 # --- Audio Device Management ---
 device_cycle = []
@@ -118,22 +120,28 @@ def find_audio_devices():
 def load_config():
     """Loads configuration from a .env file."""
     load_dotenv()
+    delay_str = os.environ.get('DELAY', str(DEFAULT_DELAY_S))
+    try:
+        delay = int(delay_str)
+    except (ValueError, TypeError):
+        delay = DEFAULT_DELAY_S
+        
     return {
         'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 
         'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY'),
         'OPEN_ROUTER_API': os.environ.get('OPEN_ROUTER_API'),
-        'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY')
+        'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY'),
+        'DELAY': delay
     }
 
 def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
     """
-    Passes STT text to multiple LLMs via OpenRouter to get review suggestions
-    and logs the prompts to the session's fix debug file.
+    Passes STT text to multiple LLMs via OpenRouter to get review suggestions,
+    with delays and retries to handle rate limiting.
     """
     debug_queue.put("[INFO] Getting STT reviews from helper LLMs...")
     config = load_config()
-    api_url = config.get("OPEN_ROUTER_API")
-    api_key = config.get("OPEN_ROUTER_KEY")
+    api_url, api_key, delay = config.get("OPEN_ROUTER_API"), config.get("OPEN_ROUTER_KEY"), config.get("DELAY")
 
     if not all([api_url, api_key]):
         debug_queue.put("[ERROR] OpenRouter API URL or Key not found in .env file.")
@@ -156,38 +164,46 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
     all_reviews = []
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    for model_name in model_names:
+    for i, model_name in enumerate(model_names):
         debug_queue.put(f"  -> Querying review model: {model_name}")
         payload = {
             "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": stt_text}
-            ]
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": stt_text}]
         }
         
-        # ADDED: Log the prompt before sending
         if fix_debug_filename:
             try:
                 with open(fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
                     timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    dbg_f.write(f"---\n### Review Prompt Sent to: {model_name} at {timestamp}\n\n")
-                    dbg_f.write(f"**System Prompt:**\n```\n{system_prompt}\n```\n\n")
-                    dbg_f.write(f"**User Prompt:**\n```\n{stt_text}\n```\n---\n\n")
+                    dbg_f.write(f"---\n### Review User Prompt Sent to: {model_name} at {timestamp}\n\n")
+                    dbg_f.write(f"```\n{stt_text}\n```\n---\n\n")
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not write to fix debug file {fix_debug_filename}: {e}")
 
-        try:
-            response = requests.post(api_url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            result = response.json()
-            review_text = result['choices'][0]['message']['content']
-            all_reviews.append(review_text)
-            debug_queue.put(f"  -> Success from {model_name}.")
-        except requests.exceptions.RequestException as e:
-            debug_queue.put(f"[ERROR] API call to {model_name} failed: {e}")
-        except (KeyError, IndexError) as e:
-            debug_queue.put(f"[ERROR] Could not parse response from {model_name}: {e}")
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = requests.post(api_url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                result = response.json()
+                review_text = result['choices'][0]['message']['content']
+                all_reviews.append(review_text)
+                debug_queue.put(f"  -> Success from {model_name}.")
+                break # Success, exit retry loop
+            except requests.exceptions.RequestException as e:
+                debug_queue.put(f"[ERROR] API call to {model_name} failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+                if attempt < MAX_RETRIES - 1:
+                    debug_queue.put(f"        Waiting for {delay} seconds before retrying...")
+                    time.sleep(delay)
+                else:
+                    debug_queue.put(f"        All retries failed for {model_name}.")
+            except (KeyError, IndexError) as e:
+                debug_queue.put(f"[ERROR] Could not parse response from {model_name}: {e}")
+                break # Don't retry on parsing errors
+
+        # Proactive delay between calls to different models
+        if i < len(model_names) - 1:
+            debug_queue.put(f"    Waiting for {delay} seconds before next model...")
+            time.sleep(delay)
 
     return "\n".join(all_reviews)
 
@@ -213,10 +229,10 @@ def convert_md_to_docx(md_filepath):
 
 
 def call_gemini_api(prompt_text, model_name, output_filename, output_queue, analysis_type, system_prompt_file=None, system_prompt_text=None, overwrite_file=False):
-    """A generalized function to call the Gemini API for different tasks."""
+    """A generalized function to call the Gemini API, with retries."""
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
     config = load_config()
-    api_host, api_key = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY")
+    api_host, api_key, delay = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY"), config.get("DELAY")
     if not all([api_host, api_key]):
         debug_queue.put("[ERROR] Gemini API credentials not found.")
         return
@@ -235,35 +251,37 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
     headers = {'Content-Type': 'application/json'}
     payload = {"contents": [{"parts": [{"text": prompt_text}]}], "systemInstruction": {"parts": [{"text": system_prompt}]}}
 
-    try:
-        response = requests.post(url, headers=headers, data=json.dumps(payload))
-        response.raise_for_status()
-        result = response.json()
-        llm_text = result['candidates'][0]['content']['parts'][0]['text']
-        
-        file_mode = 'w' if overwrite_file else 'a'
-        with open(output_filename, file_mode, encoding='utf-8') as f:
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(url, headers=headers, data=json.dumps(payload))
+            response.raise_for_status()
+            result = response.json()
+            llm_text = result['candidates'][0]['content']['parts'][0]['text']
             
+            file_mode = 'w' if overwrite_file else 'a'
+            with open(output_filename, file_mode, encoding='utf-8') as f:
+                timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}" if analysis_type == 'Summary' else llm_text
+                f.write(f"\n{content_to_write}" if file_mode == 'a' else content_to_write)
+            
+            ui_content = f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}"
+            output_queue.put(ui_content)
+            debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
+
             if analysis_type == 'Summary':
-                content_to_write = f"### {analysis_type} at {timestamp}\n\n{llm_text}"
+                convert_md_to_docx(output_filename)
+            
+            return # Success, exit function
+        except requests.exceptions.RequestException as e:
+            debug_queue.put(f"[ERROR] Gemini API call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            if attempt < MAX_RETRIES - 1:
+                debug_queue.put(f"        Waiting for {delay} seconds before retrying...")
+                time.sleep(delay)
             else:
-                content_to_write = llm_text
-
-            if file_mode == 'a':
-                f.write(f"\n{content_to_write}")
-            else:
-                f.write(content_to_write)
-        
-        ui_content = f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}"
-        output_queue.put(ui_content)
-        debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
-
-        if analysis_type == 'Summary':
-            convert_md_to_docx(output_filename)
-
-    except Exception as e:
-        debug_queue.put(f"[ERROR] Gemini API call for {analysis_type} failed: {e}")
+                debug_queue.put(f"        All retries failed for Gemini API call.")
+        except (KeyError, IndexError) as e:
+            debug_queue.put(f"[ERROR] Could not parse Gemini response: {e}")
+            return # Don't retry on parsing errors
 
 def send_and_reset_log(on_complete=None):
     """Sends the transcribed text to be fixed by Gemini and resets the buffer."""
@@ -283,12 +301,11 @@ def send_and_reset_log(on_complete=None):
                 review_context = get_review_context(prompt, session_fix_debug_filename)
                 final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt}"
                 
-                # ADDED: Log the final fix prompt before sending
                 if session_fix_debug_filename:
                     try:
                         with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
                             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            dbg_f.write(f"---\n### Final Fix Prompt Sent to Gemini at {timestamp}\n\n")
+                            dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini at {timestamp}\n\n")
                             dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
                     except IOError as e:
                         debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
@@ -398,19 +415,18 @@ def start_pause_transcription(current_status):
             if not os.path.exists(daily_output_folder):
                 os.makedirs(daily_output_folder)
             
-            # UPDATED: Timestamp now includes minutes for unique debug files per session
             timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M")
             fixed_fn = f"会议记录_{timestamp_str}.txt"
             summary_fn = f"会议总结_{timestamp_str}.md"
-            fix_debug_fn = f"dbg_fix_{timestamp_str}.md" # ADDED: Debug filename
+            fix_debug_fn = f"dbg_fix_{timestamp_str}.md"
 
             session_fixed_filename = os.path.join(daily_output_folder, fixed_fn)
             session_summary_filename = os.path.join(daily_output_folder, summary_fn)
-            session_fix_debug_filename = os.path.join(daily_output_folder, fix_debug_fn) # ADDED: Set global debug filename
+            session_fix_debug_filename = os.path.join(daily_output_folder, fix_debug_fn)
 
             debug_queue.put(f"New session. Fixed text: '{session_fixed_filename}'")
             debug_queue.put(f"             Summary: '{session_summary_filename}'")
-            debug_queue.put(f"             Fix Debug: '{session_fix_debug_filename}'") # ADDED: Announce debug file
+            debug_queue.put(f"             Fix Debug: '{session_fix_debug_filename}'")
         is_running.set()
         debug_queue.put("[UI] Transcription started.")
         return "Pause"
@@ -439,12 +455,11 @@ def stop_transcription():
             review_context = get_review_context(prompt_to_fix, session_fix_debug_filename)
             final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt_to_fix}"
             
-            # ADDED: Log the final fix prompt before sending
             if session_fix_debug_filename:
                 try:
                     with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
                         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        dbg_f.write(f"---\n### Final Fix Prompt Sent to Gemini at {timestamp}\n\n")
+                        dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini at {timestamp}\n\n")
                         dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
                 except IOError as e:
                     debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
@@ -534,15 +549,6 @@ def summarize_session():
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
             
-            # ADDED: Logic to create and write to the summary debug file
-            system_prompt_for_summary = ""
-            try:
-                with open('summarize_prompt.md', 'r', encoding='utf-8') as f:
-                    system_prompt_for_summary = f.read()
-            except FileNotFoundError:
-                debug_queue.put("[ERROR] 'summarize_prompt.md' is missing. Cannot generate summary.")
-                return
-
             summary_timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
             summary_debug_fn = f"dbg_summary_{summary_timestamp_str}.md"
             summary_debug_filepath = os.path.join(os.path.dirname(summary_output_filepath), summary_debug_fn)
@@ -550,9 +556,8 @@ def summarize_session():
 
             try:
                 with open(summary_debug_filepath, 'w', encoding='utf-8') as dbg_f:
-                    dbg_f.write(f"### Summary Prompt Sent to Gemini at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    dbg_f.write(f"**System Prompt Used:**\n```\n{system_prompt_for_summary}\n```\n\n")
-                    dbg_f.write(f"**User Prompt Sent:**\n```\n{fixed_text}\n```\n")
+                    dbg_f.write(f"### Summary User Prompt Sent to Gemini at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    dbg_f.write(f"```\n{fixed_text}\n```\n")
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not write to summary debug file {summary_debug_filepath}: {e}")
 
