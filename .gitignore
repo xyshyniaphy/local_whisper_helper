@@ -10,6 +10,7 @@ __pycache__/
 output/
 source_files/
 pdfs/
+processed/
 epubs/
 .Python
 build/
