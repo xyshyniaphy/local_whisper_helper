@@ -131,7 +131,9 @@ def load_config():
         'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY'),
         'OPEN_ROUTER_API': os.environ.get('OPEN_ROUTER_API'),
         'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY'),
-        'DELAY': delay
+        'DELAY': delay,
+        'STT_FIX_MODEL': os.environ.get('STT_FIX_MODEL', 'gemini-1.5-flash-latest'),
+        'SUMMARY_MODEL': os.environ.get('SUMMARY_MODEL', 'gemini-1.5-flash-latest')
     }
 
 def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
@@ -229,7 +231,7 @@ def convert_md_to_docx(md_filepath):
 
 def call_gemini_api(prompt_text, model_name, output_filename, output_queue, analysis_type, system_prompt_file=None, system_prompt_text=None, overwrite_file=False):
     """A generalized function to call the Gemini API, with retries."""
-    debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type}...")
+    debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type} using model {model_name}...")
     config = load_config()
     api_host, api_key, delay = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY"), config.get("DELAY")
     if not all([api_host, api_key]):
@@ -297,6 +299,9 @@ def send_and_reset_log(on_complete=None):
             text_buffer = ""
             
             def api_call_with_callback():
+                config = load_config()
+                stt_fix_model = config.get('STT_FIX_MODEL')
+                
                 review_context = get_review_context(prompt, session_fix_debug_filename)
                 final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt}"
                 
@@ -304,13 +309,13 @@ def send_and_reset_log(on_complete=None):
                     try:
                         with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
                             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini at {timestamp}\n\n")
+                            dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini ({stt_fix_model}) at {timestamp}\n\n")
                             dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
                     except IOError as e:
                         debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
 
                 call_gemini_api(
-                    final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
+                    final_prompt_for_gemini, stt_fix_model, 
                     session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
                     system_prompt_file='system_prompt.md'
                 )
@@ -451,6 +456,9 @@ def stop_transcription():
         
         if prompt_to_fix.strip():
             debug_queue.put("[INFO] Processing final text chunk before summarizing...")
+            config = load_config()
+            stt_fix_model = config.get('STT_FIX_MODEL')
+
             review_context = get_review_context(prompt_to_fix, session_fix_debug_filename)
             final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt_to_fix}"
             
@@ -458,13 +466,13 @@ def stop_transcription():
                 try:
                     with open(session_fix_debug_filename, 'a', encoding='utf-8') as dbg_f:
                         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini at {timestamp}\n\n")
+                        dbg_f.write(f"---\n### Final Fix User Prompt Sent to Gemini ({stt_fix_model}) at {timestamp}\n\n")
                         dbg_f.write(f"```\n{final_prompt_for_gemini}\n```\n---\n\n")
                 except IOError as e:
                     debug_queue.put(f"[ERROR] Could not write to fix debug file {session_fix_debug_filename}: {e}")
 
             call_gemini_api(
-                final_prompt_for_gemini, 'gemini-flash-latest-non-thinking', 
+                final_prompt_for_gemini, stt_fix_model, 
                 session_fixed_filename, fixed_text_output_queue, 'Fixed Text',
                 system_prompt_file='system_prompt.md'
             )
@@ -522,7 +530,7 @@ def find_latest_fixed_text_file():
 
 def summarize_session():
     """
-    Handles the 'Summarize' button. Re-embeds context.md into the user prompt.
+    Handles the 'Summarize' button. Embeds context.md into the user prompt.
     """
     with gemini_api_lock:
         fixed_text_filepath = session_fixed_filename
@@ -550,7 +558,6 @@ def summarize_session():
             with open(fixed_text_filepath, 'r', encoding='utf-8') as f:
                 fixed_text = f.read()
 
-            # --- REVERTED LOGIC: Read context and build the prompt ---
             context_content = ""
             try:
                 with open('context.md', 'r', encoding='utf-8') as f:
@@ -559,7 +566,9 @@ def summarize_session():
                 debug_queue.put("[WARN] 'context.md' not found for summary. Proceeding without it.")
 
             final_summary_prompt = f'{context_content}\n\n"""TEXT TO PROCESS"""\n\n{fixed_text}'
-            # --- END REVERTED LOGIC ---
+            
+            config = load_config()
+            summary_model = config.get('SUMMARY_MODEL')
 
             summary_timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
             summary_debug_fn = f"dbg_summary_{summary_timestamp_str}.md"
@@ -568,17 +577,17 @@ def summarize_session():
 
             try:
                 with open(summary_debug_filepath, 'w', encoding='utf-8') as dbg_f:
-                    dbg_f.write(f"### Summary User Prompt Sent to Gemini at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                    dbg_f.write(f"```\n{final_summary_prompt}\n```\n") # Log the correct combined prompt
+                    dbg_f.write(f"### Summary User Prompt Sent to Gemini ({summary_model}) at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    dbg_f.write(f"```\n{final_summary_prompt}\n```\n")
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not write to summary debug file {summary_debug_filepath}: {e}")
 
             if fixed_text.strip():
                 debug_queue.put("[UI] Summarize triggered. Sending full text for summary with context.")
                 threading.Thread(target=call_gemini_api, kwargs={
-                    'prompt_text': final_summary_prompt, # Send the correct combined prompt
+                    'prompt_text': final_summary_prompt,
                     'system_prompt_file': 'summarize_prompt.md', 
-                    'model_name': 'gemini-flash-latest-non-thinking',
+                    'model_name': summary_model,
                     'output_filename': summary_output_filepath, 
                     'output_queue': summary_output_queue, 
                     'analysis_type': 'Summary',
