@@ -6,14 +6,16 @@ Batch STT Transcript Correction Tool.
 This script reads all .txt files from an 'stt_input' directory, processes them
 in chunks to handle large files, corrects transcription errors using a two-stage
 LLM approach, and saves the corrected files to an 'stt_output' directory,
-preserving the original filenames.
+preserving the original filenames. It also generates a detailed debug log for
+each file.
 """
 
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, TextIO
 
 import requests
 from dotenv import load_dotenv
@@ -23,7 +25,7 @@ INPUT_DIR = Path("stt_input")
 OUTPUT_DIR = Path("stt_output")
 CHUNK_SIZE_BYTES = 10000  # Process text in chunks of this size.
 PROCESS_LOOP_DELAY_S = 60  # 1-minute delay between chunks to avoid rate limits.
-MAX_API_RETRIES = 5
+MAX_API_RETRIES = 3
 
 # Type alias for configuration dictionary for clarity.
 Config = Dict[str, Optional[str]]
@@ -55,20 +57,25 @@ def load_config() -> Config:
 
 
 def get_review_context(
-    stt_chunk: str, config: Config, review_models: List[str], review_prompt: str
+    stt_chunk: str,
+    config: Config,
+    review_models: List[str],
+    review_prompt: str,
+    debug_file: TextIO,
 ) -> str:
     """
     Gets review suggestions from multiple LLMs via OpenRouter.
 
     This function queries several smaller or specialized models to get diverse
     feedback on the STT text chunk, which is then used as context for the
-    final correction model.
+    final correction model. It also logs the prompts sent to the debug file.
 
     Args:
         stt_chunk: The chunk of text to be reviewed.
         config: The application configuration dictionary.
         review_models: A list of model identifiers to query via OpenRouter.
         review_prompt: The system prompt to guide the review models.
+        debug_file: The file handle for writing debug information.
 
     Returns:
         A string containing the concatenated reviews from all models.
@@ -88,6 +95,8 @@ def get_review_context(
         "Content-Type": "application/json",
     }
 
+    debug_file.write("### Review Stage Prompts\n\n")
+
     for model_name in review_models:
         print(f"    - Querying review model: {model_name}")
         payload = {
@@ -97,6 +106,14 @@ def get_review_context(
                 {"role": "user", "content": stt_chunk},
             ],
         }
+
+        # Write debug information before the API call
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        debug_file.write(f"**Timestamp:** {timestamp}\n")
+        debug_file.write(f"**Model:** `{model_name}`\n")
+        debug_file.write("**User Prompt Sent:**\n")
+        debug_file.write(f"```\n{stt_chunk}\n```\n---\n\n")
+        debug_file.flush()
 
         for attempt in range(MAX_API_RETRIES):
             try:
@@ -122,7 +139,11 @@ def get_review_context(
 
 
 def get_corrected_text(
-    stt_chunk: str, review_context: str, config: Config, system_prompt: str
+    stt_chunk: str,
+    review_context: str,
+    config: Config,
+    system_prompt: str,
+    debug_file: TextIO,
 ) -> Optional[str]:
     """
     Calls the primary Gemini API to perform the final text correction.
@@ -132,6 +153,7 @@ def get_corrected_text(
         review_context: Contextual reviews from other LLMs.
         config: The application configuration dictionary.
         system_prompt: The system prompt to guide the main correction model.
+        debug_file: The file handle for writing debug information.
 
     Returns:
         The corrected text as a string, or None if the API call fails.
@@ -151,6 +173,15 @@ def get_corrected_text(
         f"### STT_REVIEW_CONTEXT\n{review_context}\n\n"
         f"### STT_TEXT_TO_FIX\n{stt_chunk}"
     )
+
+    # Write debug information before the API call
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    debug_file.write("### Final Correction Stage Prompt\n\n")
+    debug_file.write(f"**Timestamp:** {timestamp}\n")
+    debug_file.write(f"**Model:** `{model_name}`\n")
+    debug_file.write("**User Prompt Sent:**\n")
+    debug_file.write(f"```\n{user_prompt}\n```\n---\n\n")
+    debug_file.flush()
 
     url = f"{api_host}/models/{model_name}:generateContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
@@ -205,23 +236,23 @@ def process_file(
         IOError: If there's an issue reading the input or writing the output file.
     """
     print(f"\n--- Processing file: {input_path.name} ---")
+    debug_path = output_path.with_suffix(".debug.md")
     chunk_count = 0
 
     try:
         with open(input_path, "r", encoding="utf-8") as infile, \
-             open(output_path, "w", encoding="utf-8") as outfile:
+             open(output_path, "w", encoding="utf-8") as outfile, \
+             open(debug_path, "w", encoding="utf-8") as debugfile:
 
             chunk_lines: List[str] = []
             current_byte_size: int = 0
 
             for line in infile:
                 # Remove all whitespace from the line as per requirements.
-                # `str.split()` with no arguments handles all whitespace types.
                 processed_line = "".join(line.strip().split())
                 if not processed_line:
                     continue  # Skip empty lines
 
-                # Add a newline for semantic separation within the chunk
                 line_to_add = processed_line + "\n"
                 chunk_lines.append(line_to_add)
                 current_byte_size += len(line_to_add.encode("utf-8"))
@@ -231,42 +262,44 @@ def process_file(
                     print(f"\n[INFO] Processing chunk #{chunk_count} "
                           f"({current_byte_size} bytes)...")
                     
-                    # Process the collected chunk
+                    debugfile.write(f"# CHUNK {chunk_count}\n\n")
+                    
                     chunk_to_process = "".join(chunk_lines)
                     review_context = get_review_context(
-                        chunk_to_process, config, review_models, review_prompt
+                        chunk_to_process, config, review_models, review_prompt, debugfile
                     )
                     corrected_chunk = get_corrected_text(
-                        chunk_to_process, review_context, config, system_prompt
+                        chunk_to_process, review_context, config, system_prompt, debugfile
                     )
 
                     if corrected_chunk:
                         outfile.write(corrected_chunk)
-                        outfile.flush()  # Write to disk immediately
                     else:
                         print("[WARN] Failed to correct chunk. Writing original "
                               "chunk to output.")
                         outfile.write(chunk_to_process)
+                    
+                    outfile.flush()
 
-                    # Reset for the next chunk
                     chunk_lines.clear()
                     current_byte_size = 0
                     
                     print(f"[INFO] Waiting for {PROCESS_LOOP_DELAY_S} seconds...")
                     time.sleep(PROCESS_LOOP_DELAY_S)
 
-            # Process any remaining text left in the buffer after the loop
             if chunk_lines:
                 chunk_count += 1
                 print(f"\n[INFO] Processing final chunk #{chunk_count} "
                       f"({current_byte_size} bytes)...")
                 
+                debugfile.write(f"# CHUNK {chunk_count} (Final)\n\n")
+                
                 final_chunk = "".join(chunk_lines)
                 review_context = get_review_context(
-                    final_chunk, config, review_models, review_prompt
+                    final_chunk, config, review_models, review_prompt, debugfile
                 )
                 corrected_chunk = get_corrected_text(
-                    final_chunk, review_context, config, system_prompt
+                    final_chunk, review_context, config, system_prompt, debugfile
                 )
 
                 if corrected_chunk:
@@ -275,6 +308,8 @@ def process_file(
                     print("[WARN] Failed to correct final chunk. Writing "
                           "original chunk to output.")
                     outfile.write(final_chunk)
+                
+                outfile.flush()
 
     except FileNotFoundError:
         raise IOError(f"Input file not found: {input_path}")
@@ -289,7 +324,6 @@ def main() -> None:
     """
     Main function to orchestrate the STT correction process.
     """
-    # 1. Setup and validation
     print("Starting STT Batch Correction Script...")
     config = load_config()
 
@@ -315,11 +349,9 @@ def main() -> None:
         print(f"[FATAL] Could not read prompt files: {e}. Exiting.")
         return
 
-    # Ensure directories exist
     INPUT_DIR.mkdir(exist_ok=True)
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    # 2. Find and process files
     txt_files_to_process = list(INPUT_DIR.glob("*.txt"))
     if not txt_files_to_process:
         print(f"[INFO] No .txt files found in '{INPUT_DIR}'. Nothing to do.")
@@ -339,8 +371,6 @@ def main() -> None:
                 system_prompt,
             )
         except Exception as e:
-            # Catch exceptions per-file to allow the script to continue
-            # with other files if one fails.
             print(f"\n[CRITICAL] Failed to process {input_file_path.name}. "
                   f"Error: {e}. Moving to next file.\n")
             continue
