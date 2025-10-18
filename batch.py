@@ -12,6 +12,7 @@ each file.
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -120,12 +121,12 @@ def get_review_context(
                 response = requests.post(
                     api_url, headers=headers, json=payload, timeout=90
                 )
-                response.raise_for_status()  # Raises HTTPError for bad responses
+                response.raise_for_status()
                 result = response.json()
                 review_text = result["choices"][0]["message"]["content"]
                 all_reviews.append(f"--- Review from {model_name} ---\n{review_text}")
                 print(f"    - Success from {model_name}.")
-                break  # Exit retry loop on success
+                break
             except requests.exceptions.RequestException as e:
                 print(f"    [ERROR] API call to {model_name} failed "
                       f"(Attempt {attempt + 1}/{MAX_API_RETRIES}): {e}")
@@ -133,7 +134,7 @@ def get_review_context(
                     time.sleep(delay_s)
             except (KeyError, IndexError) as e:
                 print(f"    [ERROR] Could not parse response from {model_name}: {e}")
-                break  # Malformed response, no need to retry
+                break
 
     return "\n\n".join(all_reviews)
 
@@ -168,13 +169,11 @@ def get_corrected_text(
         print("[ERROR] Gemini API credentials or model name not found in .env.")
         return None
 
-    # Construct the final prompt for the correction model
     user_prompt = (
         f"### STT_REVIEW_CONTEXT\n{review_context}\n\n"
         f"### STT_TEXT_TO_FIX\n{stt_chunk}"
     )
 
-    # Write debug information before the API call
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     debug_file.write("### Final Correction Stage Prompt\n\n")
     debug_file.write(f"**Timestamp:** {timestamp}\n")
@@ -213,6 +212,53 @@ def get_corrected_text(
     return None
 
 
+def _process_and_write_chunk(
+    chunk_to_process: str,
+    chunk_count: int,
+    outfile: TextIO,
+    debugfile: TextIO,
+    config: Config,
+    review_models: List[str],
+    review_prompt: str,
+    system_prompt: str,
+) -> None:
+    """
+    A common helper function to process a single chunk of text and write results.
+
+    This function encapsulates the logic for getting reviews, getting the final
+    correction, and writing the output and debug information to the respective
+    files.
+
+    Args:
+        chunk_to_process: The string content of the chunk to process.
+        chunk_count: The sequential number of the chunk for logging.
+        outfile: The file handle for the corrected text output.
+        debugfile: The file handle for the debug log.
+        config: The application configuration dictionary.
+        review_models: A list of model identifiers for the review stage.
+        review_prompt: The prompt for the review models.
+        system_prompt: The prompt for the main correction model.
+    """
+    byte_size = len(chunk_to_process.encode("utf-8"))
+    print(f"\n[INFO] Processing chunk #{chunk_count} ({byte_size} bytes)...")
+    debugfile.write(f"# CHUNK {chunk_count}\n\n")
+
+    review_context = get_review_context(
+        chunk_to_process, config, review_models, review_prompt, debugfile
+    )
+    corrected_chunk = get_corrected_text(
+        chunk_to_process, review_context, config, system_prompt, debugfile
+    )
+
+    if corrected_chunk:
+        outfile.write(corrected_chunk)
+    else:
+        print("[WARN] Failed to correct chunk. Writing original chunk to output.")
+        outfile.write(chunk_to_process)
+
+    outfile.flush()
+
+
 def process_file(
     input_path: Path,
     output_path: Path,
@@ -222,7 +268,8 @@ def process_file(
     system_prompt: str,
 ) -> None:
     """
-    Reads, processes, and writes a single file in chunks.
+    Reads an entire file, cleans it, splits it into sentence-aware chunks,
+    and processes each chunk.
 
     Args:
         input_path: Path to the source .txt file.
@@ -237,79 +284,67 @@ def process_file(
     """
     print(f"\n--- Processing file: {input_path.name} ---")
     debug_path = output_path.with_suffix(".debug.md")
-    chunk_count = 0
 
     try:
-        with open(input_path, "r", encoding="utf-8") as infile, \
-             open(output_path, "w", encoding="utf-8") as outfile, \
+        with open(input_path, "r", encoding="utf-8") as infile:
+            full_text = infile.read()
+
+        # 1. Efficiently remove all whitespace characters (space, tab, newline, etc.)
+        clean_text = re.sub(r"\s+", "", full_text)
+
+        # 2. Split by Chinese period "。", keeping the delimiter with the preceding part.
+        # The lookbehind `(?<=。)` splits the string *after* the delimiter.
+        sentences = re.split(r"(?<=。)", clean_text)
+        # Filter out any empty strings that might result from the split
+        sentences = [s for s in sentences if s]
+
+        if not sentences:
+            print(f"[INFO] File '{input_path.name}' is empty after cleaning. Skipping.")
+            # Create empty output files to signify completion
+            output_path.touch()
+            debug_path.touch()
+            return
+
+        with open(output_path, "w", encoding="utf-8") as outfile, \
              open(debug_path, "w", encoding="utf-8") as debugfile:
 
-            chunk_lines: List[str] = []
-            current_byte_size: int = 0
+            chunk_count = 0
+            current_chunk_parts: List[str] = []
+            current_byte_size = 0
 
-            for line in infile:
-                # Remove all whitespace from the line as per requirements.
-                processed_line = "".join(line.strip().split())
-                if not processed_line:
-                    continue  # Skip empty lines
+            # 3. Combine sentences into chunks of the desired size
+            for sentence in sentences:
+                sentence_bytes = len(sentence.encode("utf-8"))
 
-                line_to_add = processed_line + "\n"
-                chunk_lines.append(line_to_add)
-                current_byte_size += len(line_to_add.encode("utf-8"))
-
-                if current_byte_size >= CHUNK_SIZE_BYTES:
+                # If adding the next sentence exceeds the size, process the current chunk
+                if current_byte_size > 0 and (current_byte_size + sentence_bytes) > CHUNK_SIZE_BYTES:
                     chunk_count += 1
-                    print(f"\n[INFO] Processing chunk #{chunk_count} "
-                          f"({current_byte_size} bytes)...")
+                    chunk_to_process = "".join(current_chunk_parts)
                     
-                    debugfile.write(f"# CHUNK {chunk_count}\n\n")
-                    
-                    chunk_to_process = "".join(chunk_lines)
-                    review_context = get_review_context(
-                        chunk_to_process, config, review_models, review_prompt, debugfile
-                    )
-                    corrected_chunk = get_corrected_text(
-                        chunk_to_process, review_context, config, system_prompt, debugfile
+                    _process_and_write_chunk(
+                        chunk_to_process, chunk_count, outfile, debugfile,
+                        config, review_models, review_prompt, system_prompt
                     )
 
-                    if corrected_chunk:
-                        outfile.write(corrected_chunk)
-                    else:
-                        print("[WARN] Failed to correct chunk. Writing original "
-                              "chunk to output.")
-                        outfile.write(chunk_to_process)
-                    
-                    outfile.flush()
-
-                    chunk_lines.clear()
-                    current_byte_size = 0
+                    # Reset for the next chunk, starting with the current sentence
+                    current_chunk_parts = [sentence]
+                    current_byte_size = sentence_bytes
                     
                     print(f"[INFO] Waiting for {PROCESS_LOOP_DELAY_S} seconds...")
                     time.sleep(PROCESS_LOOP_DELAY_S)
-
-            if chunk_lines:
-                chunk_count += 1
-                print(f"\n[INFO] Processing final chunk #{chunk_count} "
-                      f"({current_byte_size} bytes)...")
-                
-                debugfile.write(f"# CHUNK {chunk_count} (Final)\n\n")
-                
-                final_chunk = "".join(chunk_lines)
-                review_context = get_review_context(
-                    final_chunk, config, review_models, review_prompt, debugfile
-                )
-                corrected_chunk = get_corrected_text(
-                    final_chunk, review_context, config, system_prompt, debugfile
-                )
-
-                if corrected_chunk:
-                    outfile.write(corrected_chunk)
                 else:
-                    print("[WARN] Failed to correct final chunk. Writing "
-                          "original chunk to output.")
-                    outfile.write(final_chunk)
-                
-                outfile.flush()
+                    # Otherwise, add the sentence to the current chunk
+                    current_chunk_parts.append(sentence)
+                    current_byte_size += sentence_bytes
+
+            # 4. Process the final remaining chunk
+            if current_chunk_parts:
+                chunk_count += 1
+                final_chunk = "".join(current_chunk_parts)
+                _process_and_write_chunk(
+                    final_chunk, chunk_count, outfile, debugfile,
+                    config, review_models, review_prompt, system_prompt
+                )
 
     except FileNotFoundError:
         raise IOError(f"Input file not found: {input_path}")
