@@ -21,7 +21,7 @@
 # 2. Then, install the other required libraries.
 #    `pypandoc-binary` is used to bundle the pandoc executable for DOCX conversion,
 #    so no separate installation of Pandoc is required.
-#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio pypandoc-binary pandas
+#    uv pip install faster-whisper sounddevice numpy python-dotenv requests gradio pandas pypandoc-binary
 #
 
 # --- Imports ---
@@ -58,7 +58,7 @@ fixed_text_output_queue = queue.Queue() # For Tab 1
 summary_output_queue = queue.Queue()   # For Tab 2
 text_buffer = "" # In-memory buffer for transcribed text
 # ADDED: State for VAD plot
-vad_prob_queue = queue.Queue()
+vad_prob_queue = queue.Queue(maxsize=100) # CORRECTED: Bounded queue to prevent memory leak
 is_vad_tab_selected = threading.Event()
 vad_prob_history = deque(maxlen=350) # Approx. 10-11 seconds of data at 31.25Hz
 
@@ -399,9 +399,12 @@ def vad_and_segmentation_loop():
             audio_chunk_tensor = torch.from_numpy(item.squeeze()).float() / 32768.0
             speech_prob = vad_model(audio_chunk_tensor, APP_CONFIG['SAMPLE_RATE']).item()
 
-            # ADDED: Conditionally send data to the plot queue if the tab is active
             if is_vad_tab_selected.is_set():
-                vad_prob_queue.put(speech_prob)
+                try:
+                    # Use non-blocking put to prevent this debug feature from slowing down audio processing
+                    vad_prob_queue.put_nowait(speech_prob)
+                except queue.Full:
+                    pass # If UI is slow, just drop the data point. It's for debug only.
 
             if speech_prob > APP_CONFIG['VAD_THRESHOLD']:
                 speech_buffer.append(item)
@@ -698,10 +701,10 @@ def update_vad_plot():
                 'VAD Threshold': threshold_data
             })
             
-            yield gr.LinePlot.update(value=df, x='Time', y=['Speech Probability', 'VAD Threshold'], y_lim=[0, 1], overlay_point=False, width=600, height=200)
+            # CORRECTED: The correct way to update a plot is to yield the new data (DataFrame).
+            # The plot's properties are set at creation time.
+            yield df
         except queue.Empty:
-            # If the queue is empty, we still need to yield something to keep the loop alive.
-            # Yielding None tells Gradio to not update the component.
             yield None
 
 def load_latest_fixed_text_ui():
@@ -754,12 +757,10 @@ def convert_latest_summary_to_docx_ui():
     debug_queue.put(f"Found latest summary: '{os.path.basename(latest_md)}'. Converting...")
     convert_md_to_docx(latest_md)
 
-# ADDED: Functions to handle tab selection for performance optimization
 def select_vad_tab():
     """Activates VAD plot data collection and clears old data."""
     debug_queue.put("[UI] VAD Plot tab selected. Initializing plot.")
     vad_prob_history.clear()
-    # Clear any stale data from the queue
     while not vad_prob_queue.empty():
         try:
             vad_prob_queue.get_nowait()
@@ -808,12 +809,20 @@ if __name__ == "__main__":
             )
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
         
-        # MODIFIED: Debug area is now a set of tabs
         with gr.Tabs():
             with gr.TabItem("Log") as log_tab:
                 debug_area = gr.Textbox(label=None, lines=5, max_lines=5, interactive=False, autoscroll=True)
             with gr.TabItem("VAD Plot") as vad_plot_tab:
-                vad_plot = gr.LinePlot(label="VAD Speech Probability")
+                # CORRECTED: The plot is now fully configured at creation time.
+                vad_plot = gr.LinePlot(
+                    x="Time",
+                    y=["Speech Probability", "VAD Threshold"],
+                    y_lim=[0, 1],
+                    overlay_point=False,
+                    width=600,
+                    height=200,
+                    label="VAD Speech Probability"
+                )
 
         output_area = gr.Textbox(label="Transcription Output", lines=10, interactive=False, autoscroll=True)
         
@@ -831,12 +840,11 @@ if __name__ == "__main__":
         load_latest_btn.click(load_latest_fixed_text_ui, outputs=[fixed_text_area])
         convert_docx_btn.click(convert_latest_summary_to_docx_ui, outputs=None)
         
-        # ADDED: Tab selection event handlers
         vad_plot_tab.select(fn=select_vad_tab)
         log_tab.select(fn=deselect_vad_tab)
         
         demo.load(create_ui_updater(debug_queue), outputs=[debug_area])
-        demo.load(update_vad_plot, outputs=[vad_plot]) # ADDED: Load the plot updater
+        demo.load(update_vad_plot, outputs=[vad_plot])
         demo.load(create_ui_updater(output_queue, is_transcription=True), outputs=[output_area])
         demo.load(create_ui_updater(fixed_text_output_queue), outputs=[fixed_text_area])
         demo.load(create_ui_updater(summary_output_queue, overwrite_ui=True), outputs=[summary_area])
