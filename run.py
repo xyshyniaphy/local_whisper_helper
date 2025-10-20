@@ -136,6 +136,7 @@ def load_config():
         'SILENCE_DURATION_S': get_env_var('SILENCE_DURATION_S', "0.8", float),
         'VAD_THRESHOLD': get_env_var('VAD_THRESHOLD', "0.5", float),
         'AUDIO_AMPLITUDE_THRESHOLD': get_env_var('AUDIO_AMPLITUDE_THRESHOLD', "1000", int),
+        'MIN_AUDIO_LENGTH': get_env_var('MIN_AUDIO_LENGTH', "2.0", float),
         'PERIODIC_GEMINI_CALL_S': get_env_var('PERIODIC_GEMINI_CALL_S', "300", int),
         'OUTPUT_FOLDER': get_env_var('OUTPUT_FOLDER', 'output', str),
         'MAX_RETRIES': get_env_var('MAX_RETRIES', "3", int),
@@ -379,7 +380,6 @@ def transcription_worker(audio_np):
 def vad_and_segmentation_loop():
     """
     The main loop for detecting speech and segmenting audio.
-    CORRECTED: This logic no longer appends silence to the speech buffer.
     """
     global vad_model
     speech_buffer, silence_counter = [], 0
@@ -400,7 +400,15 @@ def vad_and_segmentation_loop():
             elif speech_buffer:
                 silence_counter += 1
                 if silence_counter >= num_silent_chunks_needed:
-                    threading.Thread(target=transcription_worker, args=(np.concatenate(speech_buffer),)).start()
+                    # CORRECTED: Added minimum audio length check before processing.
+                    concatenated_audio = np.concatenate(speech_buffer)
+                    duration_s = len(concatenated_audio) / APP_CONFIG['SAMPLE_RATE']
+
+                    if duration_s >= APP_CONFIG['MIN_AUDIO_LENGTH']:
+                        threading.Thread(target=transcription_worker, args=(concatenated_audio,)).start()
+                    else:
+                        debug_queue.put(f"[INFO] Discarding short audio chunk ({duration_s:.2f}s < {APP_CONFIG['MIN_AUDIO_LENGTH']}s).")
+                    
                     speech_buffer.clear()
                     silence_counter = 0
         except queue.Empty:
