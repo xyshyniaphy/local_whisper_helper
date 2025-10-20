@@ -275,8 +275,6 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
             ui_content = f"---\n[{analysis_type.upper()} - {timestamp}]\n{llm_text}"
             output_queue.put(ui_content)
             debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
-
-            # REMOVED: Automatic DOCX conversion is now handled by a separate button.
             
             return 
         except requests.exceptions.RequestException as e:
@@ -350,13 +348,16 @@ def transcription_worker(audio_np):
         audio_fp32 = audio_flat.astype(np.float32) / 32768.0
         segments, info = whisper_model.transcribe(audio_fp32, language=LANGUAGE, temperature=0.0)
         
-        voice_seconds = len(audio_flat) / SAMPLE_RATE
-
+        # CORRECTED: The loop now correctly calculates duration for EACH segment.
         for segment in segments:
             transcribed_text = segment.text
             
+            # CORRECTED: Calculate duration using the segment's own start and end times.
+            segment_duration = segment.end - segment.start
+            
             text_bytes = len(transcribed_text.encode('utf-8'))
-            ratio = voice_seconds / text_bytes if text_bytes > 0 else float('inf')
+            # CORRECTED: Use the correct segment duration for the ratio.
+            ratio = segment_duration / text_bytes if text_bytes > 0 else float('inf')
             is_unnormal = (ratio < HALLUCINATION_RATIO_THRESHOLD_LOW) or (ratio > HALLUCINATION_RATIO_THRESHOLD_HIGH)
             hallucination_flag = "⚠️ HALLUCINATION ⚠️" if is_unnormal else "No"
 
@@ -366,7 +367,8 @@ def transcription_worker(audio_np):
                 try:
                     with open(session_hallucination_debug_filename, 'a', encoding='utf-8') as f:
                         text_for_md = transcribed_text.replace('|', '\|').replace('\n', ' ')
-                        f.write(f"| {int(round(voice_seconds))} | {text_bytes} | {ratio:.2f} | {hallucination_flag} | {text_for_md} |\n")
+                        # CORRECTED: Log the correct segment duration.
+                        f.write(f"| {segment_duration:.2f} | {text_bytes} | {ratio:.2f} | {hallucination_flag} | {text_for_md} |\n")
                 except IOError as e:
                     debug_queue.put(f"[ERROR] Could not write to hallucination debug file: {e}")
 
@@ -464,8 +466,9 @@ def start_pause_transcription(current_status):
             try:
                 with open(session_hallucination_debug_filename, 'w', encoding='utf-8') as f:
                     f.write("# Whisper Hallucination Analysis\n\n")
-                    f.write("| Voice (s) | Text (bytes) | Ratio (s/byte) | Potential Hallucination | Transcribed Text |\n")
-                    f.write("|-----------|--------------|----------------|---------------------------|------------------|\n")
+                    # CORRECTED: Updated header for clarity
+                    f.write("| Segment Duration (s) | Text (bytes) | Ratio (s/byte) | Potential Hallucination | Transcribed Text |\n")
+                    f.write("|----------------------|--------------|----------------|---------------------------|------------------|\n")
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not create hallucination debug file: {e}")
 
@@ -677,7 +680,6 @@ def load_latest_fixed_text_ui():
         debug_queue.put(f"[ERROR] {error}")
         return f"Error: {error}"
 
-# ADDED: New helper and UI functions for on-demand DOCX conversion
 def find_latest_summary_md_file():
     """Finds the most recent '会议总结_*.md' file in the output directories."""
     try:
@@ -736,7 +738,7 @@ if __name__ == "__main__":
             summarize_btn = gr.Button("Summarize")
             stop_btn = gr.Button("Stop")
             load_latest_btn = gr.Button("Load Latest")
-            convert_docx_btn = gr.Button("Convert to DOCX") # ADDED: New button
+            convert_docx_btn = gr.Button("Convert to DOCX")
         with gr.Row():
             ui_vad_slider = gr.Slider(minimum=0.1, maximum=1.0, value=VAD_THRESHOLD, step=0.05, label="VAD Speech Threshold")
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
@@ -756,7 +758,7 @@ if __name__ == "__main__":
         ui_vad_slider.change(change_vad_threshold, inputs=[ui_vad_slider])
         audio_source_radio.change(change_audio_source, inputs=[audio_source_radio], outputs=[start_pause_btn])
         load_latest_btn.click(load_latest_fixed_text_ui, outputs=[fixed_text_area])
-        convert_docx_btn.click(convert_latest_summary_to_docx_ui, outputs=None) # ADDED: Wire up new button
+        convert_docx_btn.click(convert_latest_summary_to_docx_ui, outputs=None)
         
         demo.load(create_ui_updater(debug_queue), outputs=debug_area)
         demo.load(create_ui_updater(output_queue, is_transcription=True), outputs=output_area)
