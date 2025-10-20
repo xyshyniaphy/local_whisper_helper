@@ -58,7 +58,7 @@ fixed_text_output_queue = queue.Queue() # For Tab 1
 summary_output_queue = queue.Queue()   # For Tab 2
 text_buffer = "" # In-memory buffer for transcribed text
 # ADDED: State for VAD plot
-vad_prob_queue = queue.Queue(maxsize=100) # CORRECTED: Bounded queue to prevent memory leak
+vad_prob_queue = queue.Queue(maxsize=100)
 is_vad_tab_selected = threading.Event()
 vad_prob_history = deque(maxlen=350) # Approx. 10-11 seconds of data at 31.25Hz
 
@@ -401,10 +401,9 @@ def vad_and_segmentation_loop():
 
             if is_vad_tab_selected.is_set():
                 try:
-                    # Use non-blocking put to prevent this debug feature from slowing down audio processing
                     vad_prob_queue.put_nowait(speech_prob)
                 except queue.Full:
-                    pass # If UI is slow, just drop the data point. It's for debug only.
+                    pass 
 
             if speech_prob > APP_CONFIG['VAD_THRESHOLD']:
                 speech_buffer.append(item)
@@ -690,22 +689,28 @@ def update_vad_plot():
         try:
             prob = vad_prob_queue.get(timeout=0.1)
             vad_prob_history.append(prob)
-            
-            prob_data = list(vad_prob_history)
-            threshold_data = [APP_CONFIG['VAD_THRESHOLD']] * len(prob_data)
-            time_steps = list(range(len(prob_data)))
-            
-            df = pd.DataFrame({
-                'Time': time_steps,
-                'Speech Probability': prob_data,
-                'VAD Threshold': threshold_data
-            })
-            
-            # CORRECTED: The correct way to update a plot is to yield the new data (DataFrame).
-            # The plot's properties are set at creation time.
-            yield df
         except queue.Empty:
             yield None
+            continue
+
+        if not vad_prob_history:
+            yield None
+            continue
+
+        prob_data = list(vad_prob_history)
+        threshold_data = [APP_CONFIG['VAD_THRESHOLD']] * len(prob_data)
+        time_steps = list(range(len(prob_data)))
+        
+        df = pd.DataFrame({
+            'Time': time_steps,
+            'Speech Probability': prob_data,
+            'VAD Threshold': threshold_data
+        })
+        
+        # CORRECTED: Reshape the DataFrame to the "long" format required by Gradio for multi-line plots.
+        df_long = df.melt(id_vars=['Time'], value_vars=['Speech Probability', 'VAD Threshold'], var_name='Series', value_name='Value')
+        
+        yield df_long
 
 def load_latest_fixed_text_ui():
     """Finds the latest fixed text file and loads its content into the UI."""
@@ -813,10 +818,11 @@ if __name__ == "__main__":
             with gr.TabItem("Log") as log_tab:
                 debug_area = gr.Textbox(label=None, lines=5, max_lines=5, interactive=False, autoscroll=True)
             with gr.TabItem("VAD Plot") as vad_plot_tab:
-                # CORRECTED: The plot is now fully configured at creation time.
+                # CORRECTED: The plot is now configured to use the "long" data format.
                 vad_plot = gr.LinePlot(
                     x="Time",
-                    y=["Speech Probability", "VAD Threshold"],
+                    y="Value",
+                    color="Series",
                     y_lim=[0, 1],
                     overlay_point=False,
                     width=600,
