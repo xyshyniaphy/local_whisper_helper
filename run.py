@@ -71,12 +71,19 @@ OUTPUT_FOLDER = "output"
 VAD_THRESHOLD = 0.5
 MAX_RETRIES = 3
 DEFAULT_DELAY_S = 5
+# ADDED: Thresholds for hallucination detection.
+# A very low ratio (e.g., < 0.1 seconds of audio per byte of text) can indicate hallucination (too much text for short audio).
+HALLUCINATION_RATIO_THRESHOLD_LOW = 0.1
+# A very high ratio (e.g., > 2.0 seconds of audio per byte of text) can indicate missed speech or long pauses.
+HALLUCINATION_RATIO_THRESHOLD_HIGH = 2.0
+
 
 # --- File & Session Management ---
 daily_output_folder = "" # Will be set to something like 'output/251009'
 session_fixed_filename = None
 session_summary_filename = None
 session_fix_debug_filename = None
+session_hallucination_debug_filename = None # ADDED: For hallucination debug logging
 
 # --- Audio Device Management ---
 device_cycle = []
@@ -269,8 +276,7 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
             output_queue.put(ui_content)
             debug_queue.put(f"[SUCCESS] {analysis_type} response saved to '{output_filename}'")
 
-            if analysis_type == 'Summary':
-                convert_md_to_docx(output_filename)
+            # REMOVED: Automatic DOCX conversion is now handled by a separate button.
             
             return 
         except requests.exceptions.RequestException as e:
@@ -333,17 +339,37 @@ def audio_callback(indata, frames, time, status):
     if is_running.is_set(): audio_queue.put(indata.copy())
 
 def transcription_worker(audio_np):
-    """Transcribes a single audio chunk and puts the result in the output queue."""
+    """
+    Transcribes a single audio chunk, logs hallucination metrics, and puts the result in the output queue.
+    """
     global text_buffer, whisper_model
     try:
         audio_flat = audio_np.flatten()
         if np.max(np.abs(audio_flat)) < 1000: return
             
         audio_fp32 = audio_flat.astype(np.float32) / 32768.0
-        segments, _ = whisper_model.transcribe(audio_fp32, language=LANGUAGE, temperature=0.0)
+        segments, info = whisper_model.transcribe(audio_fp32, language=LANGUAGE, temperature=0.0)
         
+        voice_seconds = len(audio_flat) / SAMPLE_RATE
+
         for segment in segments:
             transcribed_text = segment.text
+            
+            text_bytes = len(transcribed_text.encode('utf-8'))
+            ratio = voice_seconds / text_bytes if text_bytes > 0 else float('inf')
+            is_unnormal = (ratio < HALLUCINATION_RATIO_THRESHOLD_LOW) or (ratio > HALLUCINATION_RATIO_THRESHOLD_HIGH)
+            hallucination_flag = "⚠️ HALLUCINATION ⚠️" if is_unnormal else "No"
+
+            debug_queue.put(f"[HALLUCINATION CHECK] Ratio: {ratio:.2f} -> {hallucination_flag}")
+
+            if session_hallucination_debug_filename:
+                try:
+                    with open(session_hallucination_debug_filename, 'a', encoding='utf-8') as f:
+                        text_for_md = transcribed_text.replace('|', '\|').replace('\n', ' ')
+                        f.write(f"| {int(round(voice_seconds))} | {text_bytes} | {ratio:.2f} | {hallucination_flag} | {text_for_md} |\n")
+                except IOError as e:
+                    debug_queue.put(f"[ERROR] Could not write to hallucination debug file: {e}")
+
             output_queue.put(transcribed_text)
             text_buffer += transcribed_text + "\n"
     except Exception as e:
@@ -410,7 +436,7 @@ def main_audio_loop():
 
 def start_pause_transcription(current_status):
     """Handles the Start/Pause button logic."""
-    global session_fixed_filename, session_summary_filename, session_fix_debug_filename
+    global session_fixed_filename, session_summary_filename, session_fix_debug_filename, session_hallucination_debug_filename
     if current_status == "Start":
         if not session_fixed_filename:
             today_str = datetime.datetime.now().strftime("%y%m%d")
@@ -423,14 +449,26 @@ def start_pause_transcription(current_status):
             fixed_fn = f"会议记录_{timestamp_str}.txt"
             summary_fn = f"会议总结_{timestamp_str}.md"
             fix_debug_fn = f"dbg_fix_{timestamp_str}.md"
+            hallucination_debug_fn = f"dbg_hallucination_{timestamp_str}.md"
 
             session_fixed_filename = os.path.join(daily_output_folder, fixed_fn)
             session_summary_filename = os.path.join(daily_output_folder, summary_fn)
             session_fix_debug_filename = os.path.join(daily_output_folder, fix_debug_fn)
+            session_hallucination_debug_filename = os.path.join(daily_output_folder, hallucination_debug_fn)
 
             debug_queue.put(f"New session. Fixed text: '{session_fixed_filename}'")
             debug_queue.put(f"             Summary: '{session_summary_filename}'")
             debug_queue.put(f"             Fix Debug: '{session_fix_debug_filename}'")
+            debug_queue.put(f"             Hallucination Debug: '{session_hallucination_debug_filename}'")
+
+            try:
+                with open(session_hallucination_debug_filename, 'w', encoding='utf-8') as f:
+                    f.write("# Whisper Hallucination Analysis\n\n")
+                    f.write("| Voice (s) | Text (bytes) | Ratio (s/byte) | Potential Hallucination | Transcribed Text |\n")
+                    f.write("|-----------|--------------|----------------|---------------------------|------------------|\n")
+            except IOError as e:
+                debug_queue.put(f"[ERROR] Could not create hallucination debug file: {e}")
+
         is_running.set()
         debug_queue.put("[UI] Transcription started.")
         return "Pause"
@@ -446,7 +484,7 @@ def stop_transcription():
     debug_queue.put("[UI] Transcription stopped. Processing final text and generating summary...")
 
     def final_sequence():
-        global session_fixed_filename, session_summary_filename, session_fix_debug_filename
+        global session_fixed_filename, session_summary_filename, session_fix_debug_filename, session_hallucination_debug_filename
         
         prompt_to_fix = ""
         with gemini_api_lock:
@@ -482,7 +520,7 @@ def stop_transcription():
 
         summarize_session()
         
-        session_fixed_filename, session_summary_filename, session_fix_debug_filename = None, None, None
+        session_fixed_filename, session_summary_filename, session_fix_debug_filename, session_hallucination_debug_filename = None, None, None, None
         debug_queue.put("[UI] Session ended.")
     
     threading.Thread(target=final_sequence).start()
@@ -620,6 +658,57 @@ def create_ui_updater(q, is_transcription=False, overwrite_ui=False):
                 yield full_text
     return update_loop
 
+def load_latest_fixed_text_ui():
+    """Finds the latest fixed text file and loads its content into the UI."""
+    debug_queue.put("[UI] Attempting to load latest fixed text file...")
+    latest_file, error_msg = find_latest_fixed_text_file()
+    
+    if error_msg:
+        debug_queue.put(f"[WARN] {error_msg}")
+        return f"Error: {error_msg}"
+    
+    try:
+        with open(latest_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+        debug_queue.put(f"[SUCCESS] Loaded content from '{os.path.basename(latest_file)}'")
+        return content
+    except Exception as e:
+        error = f"Failed to read file '{os.path.basename(latest_file)}': {e}"
+        debug_queue.put(f"[ERROR] {error}")
+        return f"Error: {error}"
+
+# ADDED: New helper and UI functions for on-demand DOCX conversion
+def find_latest_summary_md_file():
+    """Finds the most recent '会议总结_*.md' file in the output directories."""
+    try:
+        date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
+        if not date_folders:
+            return None, "No date folders found in 'output'."
+        
+        latest_date_folder = sorted(date_folders, reverse=True)[0]
+        full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
+
+        summary_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议总结_') and f.endswith('.md')]
+        if not summary_files:
+            return None, f"No summary files ('会议总结_*.md') found in '{full_folder_path}'."
+        
+        latest_summary_file = sorted(summary_files, reverse=True)[0]
+        
+        return os.path.join(full_folder_path, latest_summary_file), None
+    except Exception as e:
+        return None, f"Error finding latest summary file: {e}"
+
+def convert_latest_summary_to_docx_ui():
+    """Finds the latest summary MD file and converts it to DOCX."""
+    debug_queue.put("[UI] Finding latest summary to convert to DOCX...")
+    latest_md, error_msg = find_latest_summary_md_file()
+    if error_msg:
+        debug_queue.put(f"[ERROR] {error_msg}")
+        return
+    
+    debug_queue.put(f"Found latest summary: '{os.path.basename(latest_md)}'. Converting...")
+    convert_md_to_docx(latest_md)
+
 # --- Main Execution ---
 def initialize_models():
     """Loads heavyweight models before starting threads."""
@@ -646,6 +735,8 @@ if __name__ == "__main__":
             start_pause_btn = gr.Button("Start")
             summarize_btn = gr.Button("Summarize")
             stop_btn = gr.Button("Stop")
+            load_latest_btn = gr.Button("Load Latest")
+            convert_docx_btn = gr.Button("Convert to DOCX") # ADDED: New button
         with gr.Row():
             ui_vad_slider = gr.Slider(minimum=0.1, maximum=1.0, value=VAD_THRESHOLD, step=0.05, label="VAD Speech Threshold")
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
@@ -664,6 +755,8 @@ if __name__ == "__main__":
         stop_btn.click(stop_transcription, outputs=[start_pause_btn])
         ui_vad_slider.change(change_vad_threshold, inputs=[ui_vad_slider])
         audio_source_radio.change(change_audio_source, inputs=[audio_source_radio], outputs=[start_pause_btn])
+        load_latest_btn.click(load_latest_fixed_text_ui, outputs=[fixed_text_area])
+        convert_docx_btn.click(convert_latest_summary_to_docx_ui, outputs=None) # ADDED: Wire up new button
         
         demo.load(create_ui_updater(debug_queue), outputs=debug_area)
         demo.load(create_ui_updater(output_queue, is_transcription=True), outputs=output_area)
