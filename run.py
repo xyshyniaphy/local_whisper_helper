@@ -61,29 +61,15 @@ whisper_model = None
 vad_model = None
 
 # --- Configuration ---
-MODEL_SIZE = "deepdml/faster-whisper-large-v3-turbo-ct2"
-LANGUAGE = "zh"
-SAMPLE_RATE = 16000
-VAD_CHUNK_SIZE = 512
-SILENCE_DURATION_S = 0.6
-PERIODIC_GEMINI_CALL_S = 300 # 5 minutes
-OUTPUT_FOLDER = "output"
-VAD_THRESHOLD = 0.5
-MAX_RETRIES = 3
-DEFAULT_DELAY_S = 5
-# ADDED: Thresholds for hallucination detection.
-# A very low ratio (e.g., < 0.1 seconds of audio per byte of text) can indicate hallucination (too much text for short audio).
-HALLUCINATION_RATIO_THRESHOLD_LOW = 0.1
-# A very high ratio (e.g., > 2.0 seconds of audio per byte of text) can indicate missed speech or long pauses.
-HALLUCINATION_RATIO_THRESHOLD_HIGH = 2.0
-
+# All configuration is now loaded from the .env file into this dictionary.
+APP_CONFIG = {}
 
 # --- File & Session Management ---
 daily_output_folder = "" # Will be set to something like 'output/251009'
 session_fixed_filename = None
 session_summary_filename = None
 session_fix_debug_filename = None
-session_hallucination_debug_filename = None # ADDED: For hallucination debug logging
+session_hallucination_debug_filename = None
 
 # --- Audio Device Management ---
 device_cycle = []
@@ -125,23 +111,45 @@ def find_audio_devices():
 # --- Core API and Transcription Logic ---
 
 def load_config():
-    """Loads configuration from a .env file."""
+    """Loads all configuration from a .env file into the global APP_CONFIG."""
+    global APP_CONFIG
     load_dotenv()
-    delay_str = os.environ.get('DELAY', str(DEFAULT_DELAY_S))
-    try:
-        delay = int(delay_str)
-    except (ValueError, TypeError):
-        delay = DEFAULT_DELAY_S
-        
-    return {
-        'GEMINI_API_ENDPOINT': os.environ.get('GEMINI_API_ENDPOINT'), 
-        'GEMINI_API_KEY': os.environ.get('GEMINI_API_KEY'),
-        'OPEN_ROUTER_API': os.environ.get('OPEN_ROUTER_API'),
-        'OPEN_ROUTER_KEY': os.environ.get('OPEN_ROUTER_KEY'),
-        'DELAY': delay,
-        'STT_FIX_MODEL': os.environ.get('STT_FIX_MODEL', 'gemini-1.5-flash-latest'),
-        'SUMMARY_MODEL': os.environ.get('SUMMARY_MODEL', 'gemini-1.5-flash-latest')
+    
+    def get_env_var(key, default, type_converter):
+        value = os.environ.get(key, default)
+        try:
+            return type_converter(value)
+        except (ValueError, TypeError):
+            debug_queue.put(f"[WARN] Invalid value for {key} in .env. Using default: {default}")
+            return type_converter(default)
+
+    APP_CONFIG = {
+        # API Credentials
+        'GEMINI_API_ENDPOINT': get_env_var('GEMINI_API_ENDPOINT', "", str),
+        'GEMINI_API_KEY': get_env_var('GEMINI_API_KEY', "", str),
+        'OPEN_ROUTER_API': get_env_var('OPEN_ROUTER_API', "", str),
+        'OPEN_ROUTER_KEY': get_env_var('OPEN_ROUTER_KEY', "", str),
+        # Model Selection
+        'STT_FIX_MODEL': get_env_var('STT_FIX_MODEL', 'gemini-1.5-flash-latest', str),
+        'SUMMARY_MODEL': get_env_var('SUMMARY_MODEL', 'gemini-1.5-flash-latest', str),
+        # Whisper & VAD
+        'MODEL_SIZE': get_env_var('MODEL_SIZE', 'deepdml/faster-whisper-large-v3-turbo-ct2', str),
+        'LANGUAGE': get_env_var('LANGUAGE', 'zh', str),
+        'SAMPLE_RATE': get_env_var('SAMPLE_RATE', "16000", int),
+        'VAD_CHUNK_SIZE': get_env_var('VAD_CHUNK_SIZE', "512", int),
+        'SILENCE_DURATION_S': get_env_var('SILENCE_DURATION_S', "0.8", float),
+        'VAD_THRESHOLD': get_env_var('VAD_THRESHOLD', "0.5", float),
+        # App Behavior
+        'PERIODIC_GEMINI_CALL_S': get_env_var('PERIODIC_GEMINI_CALL_S', "300", int),
+        'OUTPUT_FOLDER': get_env_var('OUTPUT_FOLDER', 'output', str),
+        'MAX_RETRIES': get_env_var('MAX_RETRIES', "3", int),
+        'DELAY': get_env_var('DELAY', "5", int),
+        # Hallucination Detection
+        'HALLUCINATION_RATIO_THRESHOLD_LOW': get_env_var('HALLUCINATION_RATIO_THRESHOLD_LOW', "0.1", float),
+        'HALLUCINATION_RATIO_THRESHOLD_HIGH': get_env_var('HALLUCINATION_RATIO_THRESHOLD_HIGH', "2.0", float),
     }
+    debug_queue.put("[INFO] Configuration loaded from .env file.")
+
 
 def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
     """
@@ -149,8 +157,7 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
     with delays and retries to handle rate limiting.
     """
     debug_queue.put("[INFO] Getting STT reviews from helper LLMs...")
-    config = load_config()
-    api_url, api_key, delay = config.get("OPEN_ROUTER_API"), config.get("OPEN_ROUTER_KEY"), config.get("DELAY")
+    api_url, api_key, delay = APP_CONFIG["OPEN_ROUTER_API"], APP_CONFIG["OPEN_ROUTER_KEY"], APP_CONFIG["DELAY"]
 
     if not all([api_url, api_key]):
         debug_queue.put("[ERROR] OpenRouter API URL or Key not found in .env file.")
@@ -189,7 +196,7 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
             except IOError as e:
                 debug_queue.put(f"[ERROR] Could not write to fix debug file {fix_debug_filename}: {e}")
 
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(APP_CONFIG['MAX_RETRIES']):
             try:
                 response = requests.post(api_url, headers=headers, json=payload, timeout=60)
                 response.raise_for_status()
@@ -199,8 +206,8 @@ def get_review_context(stt_text: str, fix_debug_filename: str) -> str:
                 debug_queue.put(f"  -> Success from {model_name}.")
                 break 
             except requests.exceptions.RequestException as e:
-                debug_queue.put(f"[ERROR] API call to {model_name} failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
-                if attempt < MAX_RETRIES - 1:
+                debug_queue.put(f"[ERROR] API call to {model_name} failed (Attempt {attempt + 1}/{APP_CONFIG['MAX_RETRIES']}): {e}")
+                if attempt < APP_CONFIG['MAX_RETRIES'] - 1:
                     debug_queue.put(f"        Waiting for {delay} seconds before retrying...")
                     time.sleep(delay)
                 else:
@@ -239,8 +246,7 @@ def convert_md_to_docx(md_filepath):
 def call_gemini_api(prompt_text, model_name, output_filename, output_queue, analysis_type, system_prompt_file=None, system_prompt_text=None, overwrite_file=False):
     """A generalized function to call the Gemini API, with retries."""
     debug_queue.put(f"[INFO] Calling Gemini API for {analysis_type} using model {model_name}...")
-    config = load_config()
-    api_host, api_key, delay = config.get("GEMINI_API_ENDPOINT"), config.get("GEMINI_API_KEY"), config.get("DELAY")
+    api_host, api_key, delay = APP_CONFIG["GEMINI_API_ENDPOINT"], APP_CONFIG["GEMINI_API_KEY"], APP_CONFIG["DELAY"]
     if not all([api_host, api_key]):
         debug_queue.put("[ERROR] Gemini API credentials not found.")
         return
@@ -259,7 +265,7 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
     headers = {'Content-Type': 'application/json'}
     payload = {"contents": [{"parts": [{"text": prompt_text}]}], "systemInstruction": {"parts": [{"text": system_prompt}]}}
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(APP_CONFIG['MAX_RETRIES']):
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload))
             response.raise_for_status()
@@ -278,8 +284,8 @@ def call_gemini_api(prompt_text, model_name, output_filename, output_queue, anal
             
             return 
         except requests.exceptions.RequestException as e:
-            debug_queue.put(f"[ERROR] Gemini API call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {e}")
-            if attempt < MAX_RETRIES - 1:
+            debug_queue.put(f"[ERROR] Gemini API call failed (Attempt {attempt + 1}/{APP_CONFIG['MAX_RETRIES']}): {e}")
+            if attempt < APP_CONFIG['MAX_RETRIES'] - 1:
                 debug_queue.put(f"        Waiting for {delay} seconds before retrying...")
                 time.sleep(delay)
             else:
@@ -303,8 +309,7 @@ def send_and_reset_log(on_complete=None):
             text_buffer = ""
             
             def api_call_with_callback():
-                config = load_config()
-                stt_fix_model = config.get('STT_FIX_MODEL')
+                stt_fix_model = APP_CONFIG['STT_FIX_MODEL']
                 
                 review_context = get_review_context(prompt, session_fix_debug_filename)
                 final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt}"
@@ -346,19 +351,16 @@ def transcription_worker(audio_np):
         if np.max(np.abs(audio_flat)) < 1000: return
             
         audio_fp32 = audio_flat.astype(np.float32) / 32768.0
-        segments, info = whisper_model.transcribe(audio_fp32, language=LANGUAGE, temperature=0.0)
+        segments, info = whisper_model.transcribe(audio_fp32, language=APP_CONFIG['LANGUAGE'], temperature=0.0)
         
-        # CORRECTED: The loop now correctly calculates duration for EACH segment.
         for segment in segments:
             transcribed_text = segment.text
             
-            # CORRECTED: Calculate duration using the segment's own start and end times.
             segment_duration = segment.end - segment.start
             
             text_bytes = len(transcribed_text.encode('utf-8'))
-            # CORRECTED: Use the correct segment duration for the ratio.
             ratio = segment_duration / text_bytes if text_bytes > 0 else float('inf')
-            is_unnormal = (ratio < HALLUCINATION_RATIO_THRESHOLD_LOW) or (ratio > HALLUCINATION_RATIO_THRESHOLD_HIGH)
+            is_unnormal = (ratio < APP_CONFIG['HALLUCINATION_RATIO_THRESHOLD_LOW']) or (ratio > APP_CONFIG['HALLUCINATION_RATIO_THRESHOLD_HIGH'])
             hallucination_flag = "⚠️ HALLUCINATION ⚠️" if is_unnormal else "No"
 
             debug_queue.put(f"[HALLUCINATION CHECK] Ratio: {ratio:.2f} -> {hallucination_flag}")
@@ -367,7 +369,6 @@ def transcription_worker(audio_np):
                 try:
                     with open(session_hallucination_debug_filename, 'a', encoding='utf-8') as f:
                         text_for_md = transcribed_text.replace('|', '\|').replace('\n', ' ')
-                        # CORRECTED: Log the correct segment duration.
                         f.write(f"| {segment_duration:.2f} | {text_bytes} | {ratio:.2f} | {hallucination_flag} | {text_for_md} |\n")
                 except IOError as e:
                     debug_queue.put(f"[ERROR] Could not write to hallucination debug file: {e}")
@@ -378,10 +379,13 @@ def transcription_worker(audio_np):
         debug_queue.put(f"[ERROR] Transcription worker failed: {e}")
 
 def vad_and_segmentation_loop():
-    """The main loop for detecting speech and segmenting audio."""
+    """
+    The main loop for detecting speech and segmenting audio.
+    CORRECTED: This logic no longer appends silence to the speech buffer.
+    """
     global vad_model
     speech_buffer, silence_counter = [], 0
-    num_silent_chunks_needed = int(SILENCE_DURATION_S * (SAMPLE_RATE / VAD_CHUNK_SIZE))
+    num_silent_chunks_needed = int(APP_CONFIG['SILENCE_DURATION_S'] * (APP_CONFIG['SAMPLE_RATE'] / APP_CONFIG['VAD_CHUNK_SIZE']))
 
     while not exit_event.is_set():
         is_running.wait()
@@ -390,19 +394,21 @@ def vad_and_segmentation_loop():
         try:
             item = audio_queue.get(timeout=0.1)
             audio_chunk_tensor = torch.from_numpy(item.squeeze()).float() / 32768.0
-            speech_prob = vad_model(audio_chunk_tensor, SAMPLE_RATE).item()
+            speech_prob = vad_model(audio_chunk_tensor, APP_CONFIG['SAMPLE_RATE']).item()
 
-            if speech_prob > VAD_THRESHOLD:
+            if speech_prob > APP_CONFIG['VAD_THRESHOLD']:
+                # Speech detected, add to buffer and reset silence counter
                 speech_buffer.append(item)
                 silence_counter = 0
             elif speech_buffer:
+                # Silence detected after speech
                 silence_counter += 1
                 if silence_counter >= num_silent_chunks_needed:
+                    # Silence duration threshold reached, process the buffered speech
                     threading.Thread(target=transcription_worker, args=(np.concatenate(speech_buffer),)).start()
                     speech_buffer.clear()
                     silence_counter = 0
-                else:
-                    speech_buffer.append(item)
+            # If it's silence and the buffer is empty, do nothing.
         except queue.Empty:
             continue
         except Exception as e:
@@ -410,9 +416,9 @@ def vad_and_segmentation_loop():
 
 def periodic_gemini_call():
     """Periodically sends accumulated text to Gemini for processing."""
-    while not exit_event.wait(PERIODIC_GEMINI_CALL_S):
+    while not exit_event.wait(APP_CONFIG['PERIODIC_GEMINI_CALL_S']):
         if is_running.is_set():
-            debug_queue.put(f"\n[TIMER] {PERIODIC_GEMINI_CALL_S // 60}-minute timer triggered.")
+            debug_queue.put(f"\n[TIMER] {APP_CONFIG['PERIODIC_GEMINI_CALL_S'] // 60}-minute timer triggered.")
             send_and_reset_log()
 
 def main_audio_loop():
@@ -421,7 +427,14 @@ def main_audio_loop():
     while not exit_event.is_set():
         current_device = device_cycle[current_cycle_index]
         try:
-            with sd.InputStream(device=current_device['id'], samplerate=SAMPLE_RATE, blocksize=VAD_CHUNK_SIZE, channels=1, dtype='int16', callback=audio_callback):
+            with sd.InputStream(
+                device=current_device['id'], 
+                samplerate=APP_CONFIG['SAMPLE_RATE'], 
+                blocksize=APP_CONFIG['VAD_CHUNK_SIZE'], 
+                channels=1, 
+                dtype='int16', 
+                callback=audio_callback
+            ):
                 restart_stream_event.wait()
         except sd.PortAudioError as e:
             debug_queue.put(f"\n[ERROR] Failed to open '{current_device['name']}'. It may be disabled.")
@@ -443,7 +456,7 @@ def start_pause_transcription(current_status):
         if not session_fixed_filename:
             today_str = datetime.datetime.now().strftime("%y%m%d")
             global daily_output_folder
-            daily_output_folder = os.path.join(OUTPUT_FOLDER, today_str)
+            daily_output_folder = os.path.join(APP_CONFIG['OUTPUT_FOLDER'], today_str)
             if not os.path.exists(daily_output_folder):
                 os.makedirs(daily_output_folder)
             
@@ -466,7 +479,6 @@ def start_pause_transcription(current_status):
             try:
                 with open(session_hallucination_debug_filename, 'w', encoding='utf-8') as f:
                     f.write("# Whisper Hallucination Analysis\n\n")
-                    # CORRECTED: Updated header for clarity
                     f.write("| Segment Duration (s) | Text (bytes) | Ratio (s/byte) | Potential Hallucination | Transcribed Text |\n")
                     f.write("|----------------------|--------------|----------------|---------------------------|------------------|\n")
             except IOError as e:
@@ -497,8 +509,7 @@ def stop_transcription():
         
         if prompt_to_fix.strip():
             debug_queue.put("[INFO] Processing final text chunk before summarizing...")
-            config = load_config()
-            stt_fix_model = config.get('STT_FIX_MODEL')
+            stt_fix_model = APP_CONFIG['STT_FIX_MODEL']
 
             review_context = get_review_context(prompt_to_fix, session_fix_debug_filename)
             final_prompt_for_gemini = f"### STT_REVIEW_CONTEXT\n{review_context}\n\n### STT_TEXT\n{prompt_to_fix}"
@@ -532,8 +543,8 @@ def stop_transcription():
 
 def change_vad_threshold(value):
     """Updates the VAD threshold from the UI slider."""
-    global VAD_THRESHOLD
-    VAD_THRESHOLD = value
+    global APP_CONFIG
+    APP_CONFIG['VAD_THRESHOLD'] = value
     debug_queue.put(f"[UI] VAD Threshold set to: {value:.2f}")
 
 def change_audio_source(device_name):
@@ -552,12 +563,12 @@ def change_audio_source(device_name):
 def find_latest_fixed_text_file():
     """Finds the most recent '会议记录_*.txt' file in the output directories."""
     try:
-        date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
+        date_folders = [d for d in os.listdir(APP_CONFIG['OUTPUT_FOLDER']) if os.path.isdir(os.path.join(APP_CONFIG['OUTPUT_FOLDER'], d)) and d.isdigit() and len(d) == 6]
         if not date_folders:
             return None, "No date folders found in 'output'."
         
         latest_date_folder = sorted(date_folders, reverse=True)[0]
-        full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
+        full_folder_path = os.path.join(APP_CONFIG['OUTPUT_FOLDER'], latest_date_folder)
 
         record_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议记录_') and f.endswith('.txt')]
         if not record_files:
@@ -608,8 +619,7 @@ def summarize_session():
 
             final_summary_prompt = f'{context_content}\n\n"""TEXT TO PROCESS"""\n\n{fixed_text}'
             
-            config = load_config()
-            summary_model = config.get('SUMMARY_MODEL')
+            summary_model = APP_CONFIG['SUMMARY_MODEL']
 
             summary_timestamp_str = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
             summary_debug_fn = f"dbg_summary_{summary_timestamp_str}.md"
@@ -683,12 +693,12 @@ def load_latest_fixed_text_ui():
 def find_latest_summary_md_file():
     """Finds the most recent '会议总结_*.md' file in the output directories."""
     try:
-        date_folders = [d for d in os.listdir(OUTPUT_FOLDER) if os.path.isdir(os.path.join(OUTPUT_FOLDER, d)) and d.isdigit() and len(d) == 6]
+        date_folders = [d for d in os.listdir(APP_CONFIG['OUTPUT_FOLDER']) if os.path.isdir(os.path.join(APP_CONFIG['OUTPUT_FOLDER'], d)) and d.isdigit() and len(d) == 6]
         if not date_folders:
             return None, "No date folders found in 'output'."
         
         latest_date_folder = sorted(date_folders, reverse=True)[0]
-        full_folder_path = os.path.join(OUTPUT_FOLDER, latest_date_folder)
+        full_folder_path = os.path.join(APP_CONFIG['OUTPUT_FOLDER'], latest_date_folder)
 
         summary_files = [f for f in os.listdir(full_folder_path) if f.startswith('会议总结_') and f.endswith('.md')]
         if not summary_files:
@@ -715,8 +725,8 @@ def convert_latest_summary_to_docx_ui():
 def initialize_models():
     """Loads heavyweight models before starting threads."""
     global whisper_model, vad_model
-    debug_queue.put(f"Loading Whisper model '{MODEL_SIZE}'...")
-    whisper_model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+    debug_queue.put(f"Loading Whisper model '{APP_CONFIG['MODEL_SIZE']}'...")
+    whisper_model = WhisperModel(APP_CONFIG['MODEL_SIZE'], device="cuda", compute_type="float16")
     debug_queue.put("Whisper model loaded.")
     try:
         debug_queue.put("Loading Silero VAD model...")
@@ -727,7 +737,8 @@ def initialize_models():
         debug_queue.put(f"[FATAL] Failed to load Silero VAD model: {e}"); exit_event.set()
 
 if __name__ == "__main__":
-    if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
+    load_config()
+    if not os.path.exists(APP_CONFIG['OUTPUT_FOLDER']): os.makedirs(APP_CONFIG['OUTPUT_FOLDER'])
     
     available_devices = find_audio_devices()
     
@@ -740,7 +751,10 @@ if __name__ == "__main__":
             load_latest_btn = gr.Button("Load Latest")
             convert_docx_btn = gr.Button("Convert to DOCX")
         with gr.Row():
-            ui_vad_slider = gr.Slider(minimum=0.1, maximum=1.0, value=VAD_THRESHOLD, step=0.05, label="VAD Speech Threshold")
+            ui_vad_slider = gr.Slider(
+                minimum=0.1, maximum=1.0, value=APP_CONFIG['VAD_THRESHOLD'], 
+                step=0.05, label="VAD Speech Threshold"
+            )
             audio_source_radio = gr.Radio(available_devices, value=available_devices[0] if available_devices else None, label="Audio Source")
         
         debug_area = gr.Textbox(label="Debug Information", lines=5, max_lines=5, interactive=False, autoscroll=True)
