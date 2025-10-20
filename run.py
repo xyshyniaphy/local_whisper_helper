@@ -61,7 +61,6 @@ whisper_model = None
 vad_model = None
 
 # --- Configuration ---
-# All configuration is now loaded from the .env file into this dictionary.
 APP_CONFIG = {}
 
 # --- File & Session Management ---
@@ -124,27 +123,23 @@ def load_config():
             return type_converter(default)
 
     APP_CONFIG = {
-        # API Credentials
         'GEMINI_API_ENDPOINT': get_env_var('GEMINI_API_ENDPOINT', "", str),
         'GEMINI_API_KEY': get_env_var('GEMINI_API_KEY', "", str),
         'OPEN_ROUTER_API': get_env_var('OPEN_ROUTER_API', "", str),
         'OPEN_ROUTER_KEY': get_env_var('OPEN_ROUTER_KEY', "", str),
-        # Model Selection
         'STT_FIX_MODEL': get_env_var('STT_FIX_MODEL', 'gemini-1.5-flash-latest', str),
         'SUMMARY_MODEL': get_env_var('SUMMARY_MODEL', 'gemini-1.5-flash-latest', str),
-        # Whisper & VAD
         'MODEL_SIZE': get_env_var('MODEL_SIZE', 'deepdml/faster-whisper-large-v3-turbo-ct2', str),
         'LANGUAGE': get_env_var('LANGUAGE', 'zh', str),
         'SAMPLE_RATE': get_env_var('SAMPLE_RATE', "16000", int),
         'VAD_CHUNK_SIZE': get_env_var('VAD_CHUNK_SIZE', "512", int),
         'SILENCE_DURATION_S': get_env_var('SILENCE_DURATION_S', "0.8", float),
         'VAD_THRESHOLD': get_env_var('VAD_THRESHOLD', "0.5", float),
-        # App Behavior
+        'AUDIO_AMPLITUDE_THRESHOLD': get_env_var('AUDIO_AMPLITUDE_THRESHOLD', "1000", int),
         'PERIODIC_GEMINI_CALL_S': get_env_var('PERIODIC_GEMINI_CALL_S', "300", int),
         'OUTPUT_FOLDER': get_env_var('OUTPUT_FOLDER', 'output', str),
         'MAX_RETRIES': get_env_var('MAX_RETRIES', "3", int),
         'DELAY': get_env_var('DELAY', "5", int),
-        # Hallucination Detection
         'HALLUCINATION_RATIO_THRESHOLD_LOW': get_env_var('HALLUCINATION_RATIO_THRESHOLD_LOW', "0.1", float),
         'HALLUCINATION_RATIO_THRESHOLD_HIGH': get_env_var('HALLUCINATION_RATIO_THRESHOLD_HIGH', "2.0", float),
     }
@@ -348,7 +343,10 @@ def transcription_worker(audio_np):
     global text_buffer, whisper_model
     try:
         audio_flat = audio_np.flatten()
-        if np.max(np.abs(audio_flat)) < 1000: return
+        # CORRECTED: Amplitude check to discard silence/noise before sending to Whisper.
+        if np.max(np.abs(audio_flat)) < APP_CONFIG['AUDIO_AMPLITUDE_THRESHOLD']:
+            debug_queue.put(f"[INFO] Discarding low-amplitude audio chunk (max amp: {np.max(np.abs(audio_flat))}).")
+            return
             
         audio_fp32 = audio_flat.astype(np.float32) / 32768.0
         segments, info = whisper_model.transcribe(audio_fp32, language=APP_CONFIG['LANGUAGE'], temperature=0.0)
@@ -397,18 +395,14 @@ def vad_and_segmentation_loop():
             speech_prob = vad_model(audio_chunk_tensor, APP_CONFIG['SAMPLE_RATE']).item()
 
             if speech_prob > APP_CONFIG['VAD_THRESHOLD']:
-                # Speech detected, add to buffer and reset silence counter
                 speech_buffer.append(item)
                 silence_counter = 0
             elif speech_buffer:
-                # Silence detected after speech
                 silence_counter += 1
                 if silence_counter >= num_silent_chunks_needed:
-                    # Silence duration threshold reached, process the buffered speech
                     threading.Thread(target=transcription_worker, args=(np.concatenate(speech_buffer),)).start()
                     speech_buffer.clear()
                     silence_counter = 0
-            # If it's silence and the buffer is empty, do nothing.
         except queue.Empty:
             continue
         except Exception as e:
