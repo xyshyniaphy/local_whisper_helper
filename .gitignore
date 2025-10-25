@@ -11,6 +11,7 @@ output/
 source_files/
 pdfs/
 processed/
+cpp/
 epubs/
 .Python
 build/
