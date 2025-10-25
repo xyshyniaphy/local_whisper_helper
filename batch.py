@@ -16,44 +16,51 @@ import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO
+from typing import Any, Dict, List, Optional, TextIO
 
 import requests
 from dotenv import load_dotenv
 
-# --- Constants and Configuration ---
-INPUT_DIR = Path("stt_input")
-OUTPUT_DIR = Path("stt_output")
-CHUNK_SIZE_BYTES = 10000  # Process text in chunks of this size.
-PROCESS_LOOP_DELAY_S = 60  # 1-minute delay between chunks to avoid rate limits.
-MAX_API_RETRIES = 3
-
+# --- Configuration ---
 # Type alias for configuration dictionary for clarity.
-Config = Dict[str, Optional[str]]
+Config = Dict[str, Any]
 
 
 def load_config() -> Config:
-    """Loads configuration from the .env file.
+    """Loads all configuration from a .env file.
 
     Returns:
         A dictionary containing the configuration values.
     """
     load_dotenv()
-    delay_str = os.getenv("API_RETRY_DELAY_S", "5")
-    try:
-        api_retry_delay = int(delay_str)
-    except (ValueError, TypeError):
-        print(f"[WARN] Invalid API_RETRY_DELAY_S value '{delay_str}'. "
-              f"Defaulting to 5 seconds.")
-        api_retry_delay = 5
+
+    def get_env_var(key, default, type_converter):
+        value = os.environ.get(key, default)
+        try:
+            return type_converter(value)
+        except (ValueError, TypeError):
+            print(f"[WARN] Invalid value for {key} in .env. Using default: {default}")
+            return type_converter(default)
 
     return {
-        "GEMINI_API_ENDPOINT": os.getenv("GEMINI_API_ENDPOINT"),
-        "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
-        "OPEN_ROUTER_API": os.getenv("OPEN_ROUTER_API"),
-        "OPEN_ROUTER_KEY": os.getenv("OPEN_ROUTER_KEY"),
-        "STT_FIX_MODEL": os.getenv("STT_FIX_MODEL", "gemini-1.5-flash-latest"),
-        "API_RETRY_DELAY_S": str(api_retry_delay),
+        # --- Directories ---
+        "INPUT_DIR": get_env_var('INPUT_DIR', 'stt_input', str),
+        "OUTPUT_DIR": get_env_var('OUTPUT_DIR', 'stt_output', str),
+
+        # --- API Credentials & Models ---
+        "GEMINI_API_ENDPOINT": get_env_var('GEMINI_API_ENDPOINT', "", str),
+        "GEMINI_API_KEY": get_env_var('GEMINI_API_KEY', "", str),
+        "OPEN_ROUTER_API": get_env_var('OPEN_ROUTER_API', "", str),
+        "OPEN_ROUTER_KEY": get_env_var('OPEN_ROUTER_KEY', "", str),
+        "STT_FIX_MODEL": get_env_var('STT_FIX_MODEL', 'gemini-1.5-flash-latest', str),
+
+        # --- Processing Parameters ---
+        "CHUNK_SIZE_BYTES": get_env_var('CHUNK_SIZE_BYTES', "10000", int),
+        "PROCESS_LOOP_DELAY_S": get_env_var('PROCESS_LOOP_DELAY_S', "60", int),
+
+        # --- API Call Parameters ---
+        "MAX_API_RETRIES": get_env_var('MAX_API_RETRIES', "3", int),
+        "API_RETRY_DELAY_S": get_env_var('API_RETRY_DELAY_S', "5", int),
     }
 
 
@@ -82,9 +89,9 @@ def get_review_context(
         A string containing the concatenated reviews from all models.
     """
     print("  -> Getting STT reviews from helper LLMs...")
-    api_url = config.get("OPEN_ROUTER_API")
-    api_key = config.get("OPEN_ROUTER_KEY")
-    delay_s = int(config.get("API_RETRY_DELAY_S", "5"))
+    api_url = config["OPEN_ROUTER_API"]
+    api_key = config["OPEN_ROUTER_KEY"]
+    delay_s = config["API_RETRY_DELAY_S"]
 
     if not all([api_url, api_key]):
         print("[ERROR] OpenRouter API URL or Key not found in .env file.")
@@ -116,7 +123,7 @@ def get_review_context(
         debug_file.write(f"```\n{stt_chunk}\n```\n---\n\n")
         debug_file.flush()
 
-        for attempt in range(MAX_API_RETRIES):
+        for attempt in range(config["MAX_API_RETRIES"]):
             try:
                 response = requests.post(
                     api_url, headers=headers, json=payload, timeout=90
@@ -129,8 +136,8 @@ def get_review_context(
                 break
             except requests.exceptions.RequestException as e:
                 print(f"    [ERROR] API call to {model_name} failed "
-                      f"(Attempt {attempt + 1}/{MAX_API_RETRIES}): {e}")
-                if attempt < MAX_API_RETRIES - 1:
+                      f"(Attempt {attempt + 1}/{config['MAX_API_RETRIES']}): {e}")
+                if attempt < config['MAX_API_RETRIES'] - 1:
                     time.sleep(delay_s)
             except (KeyError, IndexError) as e:
                 print(f"    [ERROR] Could not parse response from {model_name}: {e}")
@@ -160,10 +167,10 @@ def get_corrected_text(
         The corrected text as a string, or None if the API call fails.
     """
     print("  -> Sending text to primary LLM for final correction...")
-    api_host = config.get("GEMINI_API_ENDPOINT")
-    api_key = config.get("GEMINI_API_KEY")
-    model_name = config.get("STT_FIX_MODEL")
-    delay_s = int(config.get("API_RETRY_DELAY_S", "5"))
+    api_host = config["GEMINI_API_ENDPOINT"]
+    api_key = config["GEMINI_API_KEY"]
+    model_name = config["STT_FIX_MODEL"]
+    delay_s = config["API_RETRY_DELAY_S"]
 
     if not all([api_host, api_key, model_name]):
         print("[ERROR] Gemini API credentials or model name not found in .env.")
@@ -186,10 +193,10 @@ def get_corrected_text(
     headers = {"Content-Type": "application/json"}
     payload = {
         "contents": [{"parts": [{"text": user_prompt}]}],
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "systemInstruction": {"parts": [{"text": system_prompt}]}
     }
 
-    for attempt in range(MAX_API_RETRIES):
+    for attempt in range(config["MAX_API_RETRIES"]):
         try:
             response = requests.post(
                 url, headers=headers, data=json.dumps(payload), timeout=180
@@ -201,8 +208,8 @@ def get_corrected_text(
             return corrected_text
         except requests.exceptions.RequestException as e:
             print(f"  [ERROR] Gemini API call failed "
-                  f"(Attempt {attempt + 1}/{MAX_API_RETRIES}): {e}")
-            if attempt < MAX_API_RETRIES - 1:
+                  f"(Attempt {attempt + 1}/{config['MAX_API_RETRIES']}): {e}")
+            if attempt < config['MAX_API_RETRIES'] - 1:
                 time.sleep(delay_s)
         except (KeyError, IndexError) as e:
             print(f"  [ERROR] Could not parse Gemini response: {e}")
@@ -317,7 +324,7 @@ def process_file(
                 sentence_bytes = len(sentence.encode("utf-8"))
 
                 # If adding the next sentence exceeds the size, process the current chunk
-                if current_byte_size > 0 and (current_byte_size + sentence_bytes) > CHUNK_SIZE_BYTES:
+                if current_byte_size > 0 and (current_byte_size + sentence_bytes) > config["CHUNK_SIZE_BYTES"]:
                     chunk_count += 1
                     chunk_to_process = "".join(current_chunk_parts)
                     
@@ -330,8 +337,8 @@ def process_file(
                     current_chunk_parts = [sentence]
                     current_byte_size = sentence_bytes
                     
-                    print(f"[INFO] Waiting for {PROCESS_LOOP_DELAY_S} seconds...")
-                    time.sleep(PROCESS_LOOP_DELAY_S)
+                    print(f"[INFO] Waiting for {config['PROCESS_LOOP_DELAY_S']} seconds...")
+                    time.sleep(config['PROCESS_LOOP_DELAY_S'])
                 else:
                     # Otherwise, add the sentence to the current chunk
                     current_chunk_parts.append(sentence)
@@ -384,18 +391,20 @@ def main() -> None:
         print(f"[FATAL] Could not read prompt files: {e}. Exiting.")
         return
 
-    INPUT_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
+    input_dir = Path(config["INPUT_DIR"])
+    output_dir = Path(config["OUTPUT_DIR"])
+    input_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(exist_ok=True)
 
-    txt_files_to_process = list(INPUT_DIR.glob("*.txt"))
+    txt_files_to_process = list(input_dir.glob("*.txt"))
     if not txt_files_to_process:
-        print(f"[INFO] No .txt files found in '{INPUT_DIR}'. Nothing to do.")
+        print(f"[INFO] No .txt files found in '{input_dir}'. Nothing to do.")
         return
 
     print(f"Found {len(txt_files_to_process)} files to process.")
 
     for input_file_path in txt_files_to_process:
-        output_file_path = OUTPUT_DIR / input_file_path.name
+        output_file_path = output_dir / input_file_path.name
         try:
             process_file(
                 input_file_path,
