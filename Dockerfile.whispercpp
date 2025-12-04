@@ -1,0 +1,74 @@
+# ---------------------------------------------------
+# Stage 1: ビルド環境 (CUDA Toolkit + Build Tools)
+# ---------------------------------------------------
+FROM nvidia/cuda:12.3.1-devel-ubuntu22.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 1. 必要なツールのインストール
+# cmake, git, build-essential(g++), wget, tar, xz-utils
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    tar \
+    xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 2. whisper.cpp リポジトリのクローン
+RUN git clone https://github.com/ggml-org/whisper.cpp.git .
+
+# 3. 指定のCMakeコマンドでビルド (CUDA有効化)
+RUN cmake -B build -DGGML_CUDA=1 \
+    && cmake --build build -j --config Release
+
+# 4. モデルのダウンロード: large-v3-turbo-q5_0
+# 確実性を期すため Hugging Face から直接バイナリを取得します
+RUN wget -O ./models/ggml-large-v3-turbo-q5_0.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+
+# 5. Static FFmpeg のダウンロードと抽出
+# 展開されるフォルダ名はバージョンによって変わるため、ワイルドカード(*)を使用しています
+RUN wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+    && tar -xJf ffmpeg-release-amd64-static.tar.xz \
+    && mv ffmpeg-*-amd64-static/ffmpeg /app/ffmpeg \
+    && mv ffmpeg-*-amd64-static/ffprobe /app/ffprobe
+
+# ---------------------------------------------------
+# Stage 2: 実行環境 (軽量Runtime + Static FFmpeg)
+# ---------------------------------------------------
+FROM nvidia/cuda:12.3.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ランタイムライブラリのみインストール (aptでのffmpegは不要)
+RUN apt-get update && apt-get install -y \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1. ビルドステージから whisper.cpp の実行ファイル (main) をコピー
+# CMakeビルドの場合、通常 build/bin/ 以下に生成されます
+COPY --from=build /app/build/bin/main /app/main
+
+# 2. ビルドステージからモデルファイルをコピー
+COPY --from=build /app/models/ggml-large-v3-turbo-q5_0.bin /app/models/ggml-large-v3-turbo-q5_0.bin
+
+# 3. ビルドステージから Static FFmpeg バイナリを bin フォルダにコピー
+# システムパスの通った /usr/local/bin に配置することでどこからでも呼び出せます
+COPY --from=build /app/ffmpeg /usr/local/bin/ffmpeg
+COPY --from=build /app/ffprobe /usr/local/bin/ffprobe
+
+# 実行権限の付与
+RUN chmod +x /app/main \
+    && chmod +x /usr/local/bin/ffmpeg \
+    && chmod +x /usr/local/bin/ffprobe
+
+# エントリーポイントの設定
+ENTRYPOINT ["./main", "-m", "models/ggml-large-v3-turbo-q5_0.bin", "-l", "ja"]
+
+# デフォルト引数
+CMD ["--help"]
