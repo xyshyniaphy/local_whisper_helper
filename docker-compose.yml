@@ -1,0 +1,49 @@
+services:
+  whisper-batch:
+    # Use the image we built previously
+    image: whisper-batch-optimized:latest
+    container_name: whisper_runner
+
+    # Enable NVIDIA GPU support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # Map local files/folders to the container
+    volumes:
+      # 1. Map Audio Input & Output
+      - ./input_audio:/app/input_audio
+      - ./batch_output:/app/batch_output
+
+      # 2. Map the Python Script (Hot-reload code changes)
+      - ./batch_transcribe.py:/app/batch_transcribe.py
+      
+      # 3. Map Optional Prompts (so you can edit them too)
+      - ./summarize_prompt.md:/app/summarize_prompt.md
+      - ./context.md:/app/context.md
+
+      # 4. Map the "models" directory
+      # This maps your local "./models" folder to "/external_models" inside
+      - ./models:/external_models
+
+    # Load config from .env, but allow overrides below
+    env_file:
+      - .env
+
+    environment:
+      # Point this to the specific model folder inside the mapped directory.
+      # Example: If you have ./models/large-v3, set this to /external_models/large-v3
+      # To use the internal built-in model, comment this out or set to: /app/models/small
+      - MODEL_SIZE=/external_models/large-v3-turbo-ct2
+      
+      # Other overrides
+      - LANGUAGE=ja
+      - DO_SUMMARIZE=false
+
+    # Keep the container interactive if needed, or just run the script
+    # This command runs the script. 
+    command: python batch_transcribe.py

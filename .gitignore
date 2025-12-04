@@ -12,6 +12,8 @@ source_files/
 pdfs/
 processed/
 cpp/
+models/
+input_audio/
 epubs/
 .Python
 build/

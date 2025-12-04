@@ -154,7 +154,8 @@ class BatchTranscriber:
             segments, info = self.model.transcribe(
                 str(audio_path), 
                 language=self.config['LANGUAGE'],
-                beam_size=5
+                beam_size=5,
+                vad_filter=True # 無音区間のハルシネーション対策に必須
             )
             
             # --- Requirement: Print Audio Length ---
